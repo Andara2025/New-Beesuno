@@ -1,0 +1,10 @@
+{
+  "name": "Remix Remix Beesuno - Suno AI Sanitizer \u0026 Studio Remaster",
+  "description": "Monetisasi musik Suno AI bebas was-was. Lucuti metadata C2PA, acak fingerprint AI, mastering -14 LUFS streaming standard, dan Stealth Lyrics Cloaker.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
