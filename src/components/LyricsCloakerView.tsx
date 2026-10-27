@@ -1,9 +1,25 @@
 import React, { useState } from 'react';
-import { FileText, Copy, Check, Trash2, Zap, Music2, Tag, Eraser, CheckCircle2 } from 'lucide-react';
+import {
+  FileText,
+  Copy,
+  Check,
+  Trash2,
+  Zap,
+  Music2,
+  Tag,
+  Eraser,
+  CheckCircle2,
+  Sliders,
+  Sparkles,
+  Info
+} from 'lucide-react';
 import {
   cloakLyrics,
-  vowelMelodicMusicCloak,
+  sunoMonophoneCloak,
   syllablePacingCloak,
+  naturalLegatoCloak,
+  vowelMelodicMusicCloak,
+  countSyllablesInLine,
   stripAllBracketTags,
   SAMPLE_LYRICS_EN,
   SAMPLE_MAHALINI_MATIMATIAN,
@@ -19,17 +35,30 @@ import {
   MAQAM_CONFIGS,
 } from '../utils/arabicCloaker';
 
+const SAMPLE_KANGEN_PUJAANHATI = `Hei pujaan hati apa kabarmu
+Ku harap kau baik-baik saja
+Pujaan hati andai kau tahu
+Ku sangat mencintai dirimu
+
+Jangan pernah kau ragukan
+Kesetiaan hatiku padamu
+Ku berjanji kan selalu menjaga
+Cinta suci kita berdua`;
+
+export type MusicPresetType = 'suno-monophone' | 'syllable-pacing' | 'natural-legato' | 'vowel-melodic';
+
 export const LyricsCloakerView: React.FC = () => {
   const [langMode, setLangMode] = useState<'ar' | 'en' | 'id'>('id');
   const [arSubMode, setArSubMode] = useState<'homoglyph' | 'tartil'>('homoglyph');
   const [cadenceMode, setCadenceMode] = useState<CadenceMode>('flowing');
-  const [musicPreset, setMusicPreset] = useState<'syllable-pacing' | 'natural' | 'vowel-melodic'>('syllable-pacing');
+  const [musicPreset, setMusicPreset] = useState<MusicPresetType>('suno-monophone');
   const [includeTags, setIncludeTags] = useState<boolean>(false);
   const [selectedMaqam, setSelectedMaqam] = useState<MaqamStyle>('nahawand');
-  const [ghostShield, setGhostShield] = useState<boolean>(true);
-  const [rawLyrics, setRawLyrics] = useState<string>(SAMPLE_MINANG_MALUMALU);
+  const [ghostShield, setGhostShield] = useState<boolean>(false);
+  const [showMeterInspector, setShowMeterInspector] = useState<boolean>(false);
+  const [rawLyrics, setRawLyrics] = useState<string>(SAMPLE_MAHALINI_MATIMATIAN);
   const [cloakedLyrics, setCloakedLyrics] = useState<string>(() =>
-    syllablePacingCloak(SAMPLE_MINANG_MALUMALU, true, false)
+    sunoMonophoneCloak(SAMPLE_MAHALINI_MATIMATIAN, false, false)
   );
   const [copied, setCopied] = useState<boolean>(false);
   const [styleCopied, setStyleCopied] = useState<boolean>(false);
@@ -38,7 +67,7 @@ export const LyricsCloakerView: React.FC = () => {
   const generateOutput = (
     text: string = rawLyrics,
     lang: 'ar' | 'en' | 'id' = langMode,
-    mPreset: 'syllable-pacing' | 'natural' | 'vowel-melodic' = musicPreset,
+    mPreset: MusicPresetType = musicPreset,
     arMode: 'homoglyph' | 'tartil' = arSubMode,
     cMode: CadenceMode = cadenceMode,
     withTags: boolean = includeTags,
@@ -53,8 +82,12 @@ export const LyricsCloakerView: React.FC = () => {
         result = smoothTartilCloak(text, selectedMaqam, cMode, false, withTags);
       }
     } else {
-      if (mPreset === 'syllable-pacing') {
+      if (mPreset === 'suno-monophone') {
+        result = sunoMonophoneCloak(text, ghost, withTags);
+      } else if (mPreset === 'syllable-pacing') {
         result = syllablePacingCloak(text, ghost, withTags);
+      } else if (mPreset === 'natural-legato') {
+        result = naturalLegatoCloak(text, ghost, withTags);
       } else if (mPreset === 'vowel-melodic') {
         result = vowelMelodicMusicCloak(text, lang, ghost, withTags);
       } else {
@@ -73,7 +106,7 @@ export const LyricsCloakerView: React.FC = () => {
     setCloakedLyrics(generateOutput(rawLyrics, langMode, musicPreset, arSubMode, cMode, includeTags, ghostShield));
   };
 
-  const handleMusicPresetChange = (preset: 'syllable-pacing' | 'natural' | 'vowel-melodic') => {
+  const handleMusicPresetChange = (preset: MusicPresetType) => {
     setMusicPreset(preset);
     setCloakedLyrics(generateOutput(rawLyrics, langMode, preset, arSubMode, cadenceMode, includeTags, ghostShield));
   };
@@ -128,8 +161,8 @@ export const LyricsCloakerView: React.FC = () => {
       setRawLyrics(SAMPLE_LYRICS_EN);
       setCloakedLyrics(generateOutput(SAMPLE_LYRICS_EN, 'en', musicPreset, arSubMode, cadenceMode, includeTags, ghostShield));
     } else {
-      setRawLyrics(SAMPLE_MINANG_MALUMALU);
-      setCloakedLyrics(generateOutput(SAMPLE_MINANG_MALUMALU, 'id', musicPreset, arSubMode, cadenceMode, includeTags, ghostShield));
+      setRawLyrics(SAMPLE_MAHALINI_MATIMATIAN);
+      setCloakedLyrics(generateOutput(SAMPLE_MAHALINI_MATIMATIAN, 'id', musicPreset, arSubMode, cadenceMode, includeTags, ghostShield));
     }
   };
 
@@ -138,39 +171,38 @@ export const LyricsCloakerView: React.FC = () => {
     ? activeMaqamConfig.sunoStylePrompt
     : [
         'Emotional Indonesian pop ballad,',
+        'articulate Indonesian vocal diction,',
+        'fluent native pronunciation,',
+        'clear melodic vocal phrasing,',
+        'no staccato robotic glitch,',
         'powerful female lead vocal,',
         'intimate piano intro,',
         'dramatic orchestral strings build-up,',
         'intense soaring chorus belt,',
-        'melancholic acoustic resonance,',
         'crisp studio vocal production',
       ].join('\n');
+
+  // Breakdown baris output untuk meter visualizer
+  const outputLines = cloakedLyrics.split('\n');
 
   return (
     <div className="space-y-6">
       {/* Clean Header Bar */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-white/[0.08] pb-4">
         <div>
-          <h2 className="text-xl sm:text-2xl font-semibold text-white tracking-tight">
-            Penataan Naskah & Lirik
+          <h2 className="text-xl sm:text-2xl font-semibold text-white tracking-tight flex items-center gap-2">
+            <span>Penataan Naskah & Lirik Suno</span>
+            <span className="text-[11px] font-mono px-2 py-0.5 rounded-md bg-white/[0.06] text-zinc-300 border border-white/[0.1]">
+              v5.0 Monofon
+            </span>
           </h2>
           <p className="text-xs sm:text-sm text-zinc-400 mt-1">
-            Formatting naskah Arab, murottal maqamat, dan lirik lagu anti-copyright untuk Suno AI.
+            Solusi pemenggalan suku kata alami, monofon fonetik akurat, dan metrum birama agar lirik dinyanyikan pas di Suno AI.
           </p>
         </div>
 
         {/* Language Segmented Control (macOS Style) */}
         <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/[0.08] self-start sm:self-auto shrink-0">
-          <button
-            onClick={() => switchLanguage('ar')}
-            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
-              langMode === 'ar'
-                ? 'bg-[#2c2e38] text-white shadow-sm font-medium border border-white/15'
-                : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]'
-            }`}
-          >
-            Arab & Tartil
-          </button>
           <button
             onClick={() => switchLanguage('id')}
             className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
@@ -180,6 +212,16 @@ export const LyricsCloakerView: React.FC = () => {
             }`}
           >
             Pop Indo & Daerah
+          </button>
+          <button
+            onClick={() => switchLanguage('ar')}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition ${
+              langMode === 'ar'
+                ? 'bg-[#2c2e38] text-white shadow-sm font-medium border border-white/15'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]'
+            }`}
+          >
+            Arab & Tartil
           </button>
           <button
             onClick={() => switchLanguage('en')}
@@ -326,77 +368,125 @@ export const LyricsCloakerView: React.FC = () => {
           <div className="space-y-3">
             <div className="flex items-center justify-between">
               <span className="text-xs font-semibold text-zinc-300">
-                PILIH PRESET CADENCE
+                PILIH PRESET PEMENGGALAN & MONOFON
               </span>
               <span className="text-[10px] font-mono bg-white/[0.06] text-zinc-300 px-2 py-0.5 rounded border border-white/[0.08]">
-                {musicPreset === 'syllable-pacing'
-                  ? 'Suku Kata Berirama'
-                  : musicPreset === 'vowel-melodic'
-                  ? 'Vowel-Shift Melodic'
-                  : 'Natural Invisible'}
+                {musicPreset === 'suno-monophone'
+                  ? '⭐ Monofon Suno (Direkomendasikan)'
+                  : musicPreset === 'syllable-pacing'
+                  ? 'Suku Kata Baku'
+                  : musicPreset === 'natural-legato'
+                  ? 'Natural Legato'
+                  : 'Vowel-Shift Melodic'}
               </span>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            {/* 4 Presets Grid */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+              {/* Preset 1: Monofon Suno (Utama) */}
+              <button
+                type="button"
+                onClick={() => handleMusicPresetChange('suno-monophone')}
+                className={`p-3 rounded-xl border text-left transition flex flex-col justify-between ${
+                  musicPreset === 'suno-monophone'
+                    ? 'bg-[#262833] text-white border-white/30 ring-1 ring-white/10 shadow-sm'
+                    : 'bg-black/20 border-white/[0.06] hover:border-white/[0.15] text-zinc-400'
+                }`}
+              >
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold flex items-center gap-1">
+                      <span>Monofon Suno</span>
+                      <span className="text-[10px] text-amber-300 font-normal">⭐ Pas</span>
+                    </span>
+                    {musicPreset === 'suno-monophone' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                  </div>
+                  <div className={`text-[11px] mt-1 font-mono ${musicPreset === 'suno-monophone' ? 'text-zinc-300' : 'text-zinc-500'}`}>
+                    chin-ta, ter-chip-ta
+                  </div>
+                </div>
+                <div className="text-[10px] text-zinc-400 mt-2">
+                  Adaptasi fonetik Suno (huruf &apos;c&apos; dibaca /tʃ/, bukan &apos;k&apos;).
+                </div>
+              </button>
+
+              {/* Preset 2: Suku Kata Baku */}
               <button
                 type="button"
                 onClick={() => handleMusicPresetChange('syllable-pacing')}
-                className={`p-3 rounded-xl border text-left transition ${
+                className={`p-3 rounded-xl border text-left transition flex flex-col justify-between ${
                   musicPreset === 'syllable-pacing'
                     ? 'bg-[#262833] text-white border-white/30 ring-1 ring-white/10 shadow-sm'
                     : 'bg-black/20 border-white/[0.06] hover:border-white/[0.15] text-zinc-400'
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold">Suku Kata Berirama (-)</span>
-                  {musicPreset === 'syllable-pacing' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold">Suku Kata Baku (-)</span>
+                    {musicPreset === 'syllable-pacing' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                  </div>
+                  <div className={`text-[11px] mt-1 font-mono ${musicPreset === 'syllable-pacing' ? 'text-zinc-300' : 'text-zinc-500'}`}>
+                    cin-ta, ter-cip-ta
+                  </div>
                 </div>
-                <div className={`text-[11px] mt-1 font-mono ${musicPreset === 'syllable-pacing' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                  ma-lu, de-nai ta-ma-lu
+                <div className="text-[10px] text-zinc-400 mt-2">
+                  Kaidah baku KBBI & diftong utuh tanpa ubah huruf.
                 </div>
               </button>
 
+              {/* Preset 3: Natural Legato */}
               <button
                 type="button"
-                onClick={() => handleMusicPresetChange('natural')}
-                className={`p-3 rounded-xl border text-left transition ${
-                  musicPreset === 'natural'
+                onClick={() => handleMusicPresetChange('natural-legato')}
+                className={`p-3 rounded-xl border text-left transition flex flex-col justify-between ${
+                  musicPreset === 'natural-legato'
                     ? 'bg-[#262833] text-white border-white/30 ring-1 ring-white/10 shadow-sm'
                     : 'bg-black/20 border-white/[0.06] hover:border-white/[0.15] text-zinc-400'
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold">Natural Zero-Width</span>
-                  {musicPreset === 'natural' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold">Natural Legato</span>
+                    {musicPreset === 'natural-legato' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                  </div>
+                  <div className={`text-[11px] mt-1 ${musicPreset === 'natural-legato' ? 'text-zinc-300' : 'text-zinc-500'}`}>
+                    cinta, tercipta
+                  </div>
                 </div>
-                <div className={`text-[11px] mt-1 ${musicPreset === 'natural' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                  Ejaan asli tanpa tanda hubung
+                <div className="text-[10px] text-zinc-400 mt-2">
+                  Kata utuh tanpa tanda hubung untuk vokal mengalir/cepat.
                 </div>
               </button>
 
+              {/* Preset 4: Vowel-Shift Melodic */}
               <button
                 type="button"
                 onClick={() => handleMusicPresetChange('vowel-melodic')}
-                className={`p-3 rounded-xl border text-left transition ${
+                className={`p-3 rounded-xl border text-left transition flex flex-col justify-between ${
                   musicPreset === 'vowel-melodic'
                     ? 'bg-[#262833] text-white border-white/30 ring-1 ring-white/10 shadow-sm'
                     : 'bg-black/20 border-white/[0.06] hover:border-white/[0.15] text-zinc-400'
                 }`}
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold">Vowel-Shift (~)</span>
-                  {musicPreset === 'vowel-melodic' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                <div>
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold">Vowel-Shift (~)</span>
+                    {musicPreset === 'vowel-melodic' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
+                  </div>
+                  <div className={`text-[11px] mt-1 ${musicPreset === 'vowel-melodic' ? 'text-zinc-300' : 'text-zinc-500'}`}>
+                    cintá~, terciptá~
+                  </div>
                 </div>
-                <div className={`text-[11px] mt-1 ${musicPreset === 'vowel-melodic' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                  Vokal beraksen & simbol bernyanyi
+                <div className="text-[10px] text-zinc-400 mt-2">
+                  Vokal beraksen & simbol sustain lagu melow.
                 </div>
               </button>
             </div>
 
-            {/* Tag Controls & Zero-Width Shield */}
+            {/* Tag Controls, Meter Toggle & Zero-Width Shield */}
             <div className="pt-3 border-t border-white/[0.06] flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2">
-                <span className="text-[11px] font-mono text-zinc-400">TAG:</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-[11px] font-mono text-zinc-400">PILIHAN:</span>
                 <button
                   type="button"
                   onClick={() => handleToggleTags(false)}
@@ -420,20 +510,43 @@ export const LyricsCloakerView: React.FC = () => {
                   <Tag className="w-3 h-3" />
                   <span>Sertakan [Verse/Chorus]</span>
                 </button>
+
+                <button
+                  type="button"
+                  onClick={() => setShowMeterInspector(!showMeterInspector)}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium transition flex items-center gap-1.5 ${
+                    showMeterInspector
+                      ? 'bg-[#2c2e38] text-white font-medium border border-white/15 shadow-sm'
+                      : 'bg-black/30 text-zinc-400 hover:text-zinc-200 border border-white/[0.06]'
+                  }`}
+                >
+                  <Sliders className="w-3 h-3" />
+                  <span>{showMeterInspector ? 'Sembunyikan Metrum' : 'Cek Metrum Suku Kata'}</span>
+                </button>
               </div>
 
-              <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300 bg-black/30 px-3 py-1.5 rounded-lg border border-white/[0.06]">
-                <input
-                  type="checkbox"
-                  checked={ghostShield}
-                  onChange={(e) => {
-                    setGhostShield(e.target.checked);
-                    setCloakedLyrics(generateOutput(rawLyrics, langMode, musicPreset, arSubMode, cadenceMode, includeTags, e.target.checked));
-                  }}
-                  className="w-3.5 h-3.5 rounded accent-white"
-                />
-                <span className="font-medium text-zinc-300">Invisible Zero-Width Shield</span>
-              </label>
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-2 cursor-pointer text-xs text-zinc-300 bg-black/30 px-3 py-1.5 rounded-lg border border-white/[0.06]">
+                  <input
+                    type="checkbox"
+                    checked={ghostShield}
+                    onChange={(e) => {
+                      setGhostShield(e.target.checked);
+                      setCloakedLyrics(generateOutput(rawLyrics, langMode, musicPreset, arSubMode, cadenceMode, includeTags, e.target.checked));
+                    }}
+                    className="w-3.5 h-3.5 rounded accent-white"
+                  />
+                  <span className="font-medium text-zinc-300">Invisible Zero-Width Shield</span>
+                </label>
+              </div>
+            </div>
+
+            {/* Helper note for zero-width */}
+            <div className="text-[11px] text-zinc-400 flex items-start gap-1.5 bg-black/20 p-2 rounded-lg border border-white/[0.04]">
+              <Info className="w-3.5 h-3.5 text-zinc-400 shrink-0 mt-0.5" />
+              <span>
+                <strong>Tips Vokal Pas:</strong> Mode <em>Monofon Suno</em> secara otomatis mengubah ejaan &apos;c&apos; menjadi &apos;ch&apos; (seperti &apos;chin-ta&apos;) dan memenggal suku kata secara presisi sehingga AI Suno menyanyi dengan lafal asli Indonesia tanpa jeda gagap. Zero-Width disarankan dinonaktifkan agar vokal tidak tersendat.
+              </span>
             </div>
           </div>
         )}
@@ -446,25 +559,37 @@ export const LyricsCloakerView: React.FC = () => {
         <button
           onClick={() => {
             setLangMode('id');
-            setMusicPreset('syllable-pacing');
-            setRawLyrics(SAMPLE_MINANG_MALUMALU);
-            setCloakedLyrics(generateOutput(SAMPLE_MINANG_MALUMALU, 'id', 'syllable-pacing', arSubMode, cadenceMode, includeTags, ghostShield));
+            setMusicPreset('suno-monophone');
+            setRawLyrics(SAMPLE_MAHALINI_MATIMATIAN);
+            setCloakedLyrics(generateOutput(SAMPLE_MAHALINI_MATIMATIAN, 'id', 'suno-monophone', arSubMode, cadenceMode, includeTags, ghostShield));
           }}
           className="bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border border-white/[0.08] px-2.5 py-1 rounded-lg transition"
         >
-          Minang: Malu-Malu Denai
+          Mahalini: Mati-Matian
         </button>
 
         <button
           onClick={() => {
             setLangMode('id');
-            setMusicPreset('syllable-pacing');
-            setRawLyrics(SAMPLE_MAHALINI_MATIMATIAN);
-            setCloakedLyrics(generateOutput(SAMPLE_MAHALINI_MATIMATIAN, 'id', 'syllable-pacing', arSubMode, cadenceMode, includeTags, ghostShield));
+            setMusicPreset('suno-monophone');
+            setRawLyrics(SAMPLE_KANGEN_PUJAANHATI);
+            setCloakedLyrics(generateOutput(SAMPLE_KANGEN_PUJAANHATI, 'id', 'suno-monophone', arSubMode, cadenceMode, includeTags, ghostShield));
           }}
           className="bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border border-white/[0.08] px-2.5 py-1 rounded-lg transition"
         >
-          Mahalini: Mati-Matian
+          Kangen Band: Pujaan Hati
+        </button>
+
+        <button
+          onClick={() => {
+            setLangMode('id');
+            setMusicPreset('suno-monophone');
+            setRawLyrics(SAMPLE_MINANG_MALUMALU);
+            setCloakedLyrics(generateOutput(SAMPLE_MINANG_MALUMALU, 'id', 'suno-monophone', arSubMode, cadenceMode, includeTags, ghostShield));
+          }}
+          className="bg-white/[0.04] hover:bg-white/[0.08] text-zinc-300 border border-white/[0.08] px-2.5 py-1 rounded-lg transition"
+        >
+          Minang: Malu-Malu Denai
         </button>
 
         <button
@@ -502,9 +627,9 @@ export const LyricsCloakerView: React.FC = () => {
       </div>
 
       {/* Dual Textboxes Container */}
-      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-start">
         {/* Left: Original Lyrics */}
-        <div className="lg:col-span-5 bg-[#14151b] border border-white/[0.08] rounded-2xl p-4 flex flex-col h-[480px]">
+        <div className="lg:col-span-5 bg-[#14151b] border border-white/[0.08] rounded-2xl p-4 flex flex-col h-[520px]">
           <div className="flex items-center justify-between pb-3 border-b border-white/[0.06] mb-2">
             <span className="text-xs font-semibold text-zinc-300">
               Naskah Input Asli
@@ -529,13 +654,13 @@ export const LyricsCloakerView: React.FC = () => {
           />
 
           <div className="pt-2 border-t border-white/[0.06] flex items-center justify-between text-[10px] font-mono text-zinc-500">
-            <span>{rawLyrics.split('\n').length} Baris</span>
+            <span>{rawLyrics.split('\n').filter((l) => l.trim().length > 0).length} Baris Naskah</span>
             <span>{rawLyrics.length} Karakter</span>
           </div>
         </div>
 
         {/* Center: Action Button */}
-        <div className="lg:col-span-2 flex flex-col items-center justify-center py-2">
+        <div className="lg:col-span-2 flex flex-col items-center justify-center py-4 lg:py-40 gap-2">
           <button
             onClick={() => handleCloak()}
             className="w-full sm:w-auto bg-[#2c2e38] hover:bg-[#363845] text-white px-5 py-4 rounded-2xl shadow-sm border border-white/15 flex flex-col items-center justify-center gap-1.5 transition active:scale-95 font-medium text-xs sm:text-sm"
@@ -543,13 +668,21 @@ export const LyricsCloakerView: React.FC = () => {
             <Zap className="w-5 h-5 text-zinc-300" />
             <span>Format Naskah</span>
           </button>
+          <span className="text-[10px] text-zinc-500 text-center font-mono">
+            {langMode === 'id' ? 'Pemenggalan & Monofon' : 'Struktur & Format'}
+          </span>
         </div>
 
         {/* Right: Cloaked Output */}
-        <div className="lg:col-span-5 bg-[#14151b] border border-white/[0.12] rounded-2xl p-4 flex flex-col h-[480px] shadow-sm">
+        <div className="lg:col-span-5 bg-[#14151b] border border-white/[0.12] rounded-2xl p-4 flex flex-col h-[520px] shadow-sm">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-white/[0.06] mb-2 gap-2">
-            <span className="text-xs font-semibold text-zinc-200">
-              Hasil Terformat (Siap Suno)
+            <span className="text-xs font-semibold text-zinc-200 flex items-center gap-1.5">
+              <span>Hasil Terformat (Siap Suno)</span>
+              {musicPreset === 'suno-monophone' && (
+                <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">
+                  Monofon Pas
+                </span>
+              )}
             </span>
 
             <div className="flex items-center gap-2 shrink-0">
@@ -590,15 +723,68 @@ export const LyricsCloakerView: React.FC = () => {
         </div>
       </div>
 
+      {/* Syllable Meter Inspector (Metrum Birama Suku Kata per Baris) */}
+      {showMeterInspector && langMode !== 'ar' && (
+        <div className="bg-[#14151b] border border-white/[0.08] rounded-2xl p-4 space-y-3">
+          <div className="flex items-center justify-between border-b border-white/[0.06] pb-2">
+            <div className="flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-zinc-300" />
+              <h4 className="text-xs font-semibold text-white">
+                Inspektur Metrum & Ketukan Suku Kata per Baris
+              </h4>
+            </div>
+            <span className="text-[10px] font-mono text-zinc-400">
+              Ideal untuk lagu pop/ballad 4/4: 6 - 10 suku kata per baris
+            </span>
+          </div>
+
+          <div className="max-h-60 overflow-y-auto space-y-1.5 pr-2">
+            {outputLines.map((line, idx) => {
+              const trimmed = line.trim();
+              if (!trimmed) return null;
+              const isTag = trimmed.startsWith('[') && trimmed.endsWith(']');
+              const count = isTag ? 0 : countSyllablesInLine(trimmed);
+
+              return (
+                <div
+                  key={idx}
+                  className={`flex items-center justify-between text-xs px-3 py-1.5 rounded-lg border ${
+                    isTag
+                      ? 'bg-black/30 border-white/[0.04] text-zinc-500 font-mono'
+                      : 'bg-black/20 border-white/[0.06] text-zinc-300 font-mono'
+                  }`}
+                >
+                  <span className="truncate pr-4">{trimmed}</span>
+                  {!isTag && (
+                    <span
+                      className={`shrink-0 font-mono text-[10px] px-2 py-0.5 rounded ${
+                        count >= 6 && count <= 10
+                          ? 'bg-emerald-500/10 text-emerald-300 border border-emerald-500/20'
+                          : count > 12
+                          ? 'bg-amber-500/10 text-amber-300 border border-amber-500/20'
+                          : 'bg-white/[0.06] text-zinc-400 border border-white/[0.08]'
+                      }`}
+                    >
+                      {count} ketukan
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Style of Music Prompt Box */}
       <div className="bg-[#14151b] border border-white/[0.08] rounded-2xl p-5 space-y-3">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
           <div>
-            <h4 className="text-sm font-semibold text-white">
-              Prompt Kolom &quot;Style of Music&quot; di Suno AI
+            <h4 className="text-sm font-semibold text-white flex items-center gap-2">
+              <span>Prompt Kolom &quot;Style of Music&quot; di Suno AI</span>
+              <Sparkles className="w-3.5 h-3.5 text-zinc-400" />
             </h4>
             <p className="text-xs text-zinc-400 mt-0.5">
-              Salin prompt berikut ke kolom Style of Music di Suno AI untuk panduan karakter aransemen vokal.
+              Salin prompt berikut ke kolom Style of Music di Suno AI untuk mengunci kejelasan diksi vokal bahasa Indonesia.
             </p>
           </div>
 

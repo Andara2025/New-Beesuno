@@ -47,7 +47,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   // Preset & Processing Options
   const [selectedPreset, setSelectedPreset] = useState<CanonicalArmorPresetId>(DEFAULT_ARMOR_PRESET);
   const [durationMode, setDurationMode] = useState<'60s' | 'full'>('60s');
-  const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('wav');
+  const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('mp3');
   const [startTime, setStartTime] = useState<number>(0);
 
   // Audio Source State
@@ -216,75 +216,12 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       limiter.attack.value = 0.003;
       limiter.release.value = 0.05;
 
-      if (activePreset === 'warm_armor') {
-        // Preset 3: Warm Armor (RESONANSI HANGAT)
-        // Stage 1: Dual identical in-phase cancellation (c0=c0-c1 | c1=c0-c1) -> Mono-Safe!
-        invertR.gain.value = -1.0;
-        invertL.gain.value = -1.0;
-
-        splitter.connect(directL, 0);
-        splitter.connect(invertR, 1);
-        directL.connect(merger, 0, 0);
-        invertR.connect(merger, 0, 0);
-
-        // Right channel gets identical c0 - c1
-        directL.connect(merger, 0, 1);
-        invertR.connect(merger, 0, 1);
-
-        // Stage 2: Highpass 160 Hz
-        const highpass = ctx.createBiquadFilter();
-        highpass.type = 'highpass';
-        highpass.frequency.value = 160;
-
-        // Stage 3: Low-shelf bass boost +3 dB @ 180 Hz
-        const bassBoost = ctx.createBiquadFilter();
-        bassBoost.type = 'lowshelf';
-        bassBoost.frequency.value = 180;
-        bassBoost.gain.value = 3.0;
-
-        // Stage 4: Notch EQ -11 dB @ 1800 Hz, Q 1.2
-        const notch = ctx.createBiquadFilter();
-        notch.type = 'peaking';
-        notch.frequency.value = 1800;
-        notch.Q.value = 1.2;
-        notch.gain.value = -11.0;
-
-        // Stage 5: Tremolo 5.5 Hz, depth 0.88
-        const tremoloGain = ctx.createGain();
-        tremoloGain.gain.value = 0.56;
-
-        const lfo = ctx.createOscillator();
-        lfo.type = 'sine';
-        lfo.frequency.value = 5.5;
-        lfoNodeRef.current = lfo;
-
-        const lfoDepth = ctx.createGain();
-        lfoDepth.gain.value = 0.44;
-
-        lfo.connect(lfoDepth);
-        lfoDepth.connect(tremoloGain.gain);
-        lfo.start();
-
-        // Stage 6 & 7: Tempo +5% (rate = 0.8908987 * 1.05), Volume 2.2x
-        rate = ARMOR_CONSTANTS.PITCH_SHIFT * 1.05;
-        source.playbackRate.value = rate;
-
-        const volumeGain = ctx.createGain();
-        volumeGain.gain.value = 2.2;
-
-        merger.connect(highpass);
-        highpass.connect(bassBoost);
-        bassBoost.connect(notch);
-        notch.connect(tremoloGain);
-        tremoloGain.connect(volumeGain);
-        volumeGain.connect(limiter);
-      } else if (activePreset === 'pulse_armor') {
+      if (activePreset === 'pulse_armor') {
         // Preset 2: Pulse Armor (DENYUT RITMIS)
-        // Stage 1: Modulated center attenuation cycle of 3.0s (k=0.78 to 1.00 with 50ms smooth ramps)
+        // Stage 1: Modulated center attenuation cycle k(t) [0.78..1.00]
         invertR.gain.value = -0.78;
         invertL.gain.value = -0.78;
 
-        // Schedule periodic 3-second cycle for k(t)
         const curvePoints = 60;
         const kCurve = new Float32Array(curvePoints);
         for (let i = 0; i < curvePoints; i++) {
@@ -308,20 +245,89 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         directR.connect(merger, 0, 1);
         invertL.connect(merger, 0, 1);
 
-        // Stage 2: Highpass 250 Hz
+        // Stage 2: Highpass 220 Hz
         const highpass = ctx.createBiquadFilter();
         highpass.type = 'highpass';
-        highpass.frequency.value = 250;
+        highpass.frequency.value = 220;
 
-        // Stage 3 & 4: pitchCore -2st, volume 1.6x
+        // Stage 3: Notch EQ -8 dB @ 1800 Hz
+        const notch = ctx.createBiquadFilter();
+        notch.type = 'peaking';
+        notch.frequency.value = 1800;
+        notch.Q.value = 1.2;
+        notch.gain.value = -8.0;
+
+        // Stage 4: Tremolo LFO 5.5 Hz for rhythmic pulse effect
+        const tremoloGain = ctx.createGain();
+        tremoloGain.gain.value = 0.56;
+
+        const lfo = ctx.createOscillator();
+        lfo.type = 'sine';
+        lfo.frequency.value = 5.5;
+        lfoNodeRef.current = lfo;
+
+        const lfoDepth = ctx.createGain();
+        lfoDepth.gain.value = 0.44;
+
+        lfo.connect(lfoDepth);
+        lfoDepth.connect(tremoloGain.gain);
+        lfo.start();
+
+        // Stage 5: Tempo +5% (rate = 0.8908987 * 1.05) & Volume 2.0x
+        rate = ARMOR_CONSTANTS.PITCH_SHIFT * 1.05;
+        source.playbackRate.value = rate;
+
+        const volumeGain = ctx.createGain();
+        volumeGain.gain.value = 2.0;
+
+        merger.connect(highpass);
+        highpass.connect(notch);
+        notch.connect(tremoloGain);
+        tremoloGain.connect(volumeGain);
+        volumeGain.connect(limiter);
+      } else if (activePreset === 'warm_armor') {
+        // Preset 3: Warm Armor (RESONANSI HANGAT)
+        // Stage 1: Dual identical in-phase cancellation (c0=c0-c1 | c1=c0-c1) -> Mono-Safe!
+        invertR.gain.value = -1.0;
+        invertL.gain.value = -1.0;
+
+        splitter.connect(directL, 0);
+        splitter.connect(invertR, 1);
+        directL.connect(merger, 0, 0);
+        invertR.connect(merger, 0, 0);
+
+        // Right channel gets identical c0 - c1
+        directL.connect(merger, 0, 1);
+        invertR.connect(merger, 0, 1);
+
+        // Stage 2: Gentle Highpass 160 Hz (preserves full warm body)
+        const highpass = ctx.createBiquadFilter();
+        highpass.type = 'highpass';
+        highpass.frequency.value = 160;
+
+        // Stage 3: Low-shelf warm bass boost +3 dB @ 180 Hz
+        const bassBoost = ctx.createBiquadFilter();
+        bassBoost.type = 'lowshelf';
+        bassBoost.frequency.value = 180;
+        bassBoost.gain.value = 3.0;
+
+        // Stage 4: Gentle high roll-off for analog warmth
+        const highShelf = ctx.createBiquadFilter();
+        highShelf.type = 'highshelf';
+        highShelf.frequency.value = 8000;
+        highShelf.gain.value = -1.0;
+
+        // Stage 5: Normal tempo 1.0x (tempo asli natural santai)
         rate = ARMOR_CONSTANTS.PITCH_SHIFT;
         source.playbackRate.value = rate;
 
         const volumeGain = ctx.createGain();
-        volumeGain.gain.value = 1.6;
+        volumeGain.gain.value = 1.8;
 
         merger.connect(highpass);
-        highpass.connect(volumeGain);
+        highpass.connect(bassBoost);
+        bassBoost.connect(highShelf);
+        highShelf.connect(volumeGain);
         volumeGain.connect(limiter);
       } else {
         // Preset 1: Vocal Armor (VOKAL JELAS)
@@ -682,9 +688,9 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   /**
    * In-browser Web Audio DSP engine executing offline rendering:
    * - Phase cancellation matrix according to technical spec:
-   *   - Vocal Armor: Anti-phase c0=c0-c1 | c1=c1-c0, Highpass 250Hz, pitchCore, Volume 1.6x, Limiter 0.95
-   *   - Pulse Armor: Modulated center attenuation k(t) [0.78..1.00] with 50ms ramps, Highpass 250Hz, pitchCore, Volume 1.6x, Limiter 0.95
-   *   - Warm Armor: Dual identical in-phase c0=c0-c1 | c1=c0-c1 (mono-safe), Highpass 160Hz, Bass +3dB @ 180Hz, Notch -11dB @ 1800Hz, Tremolo 5.5Hz, Tempo +5%, Volume 2.2x, Limiter 0.95
+   *   - Vocal Armor: Anti-phase c0=c0-c1 | c1=c1-c0, Highpass 195Hz, pitchCore -2st, Volume 1.6x, Limiter 0.95
+   *   - Pulse Armor: Modulated center attenuation k(t) [0.78..1.00], Notch 1.8kHz, Tremolo LFO 5.5Hz, Tempo +5%, Highpass 220Hz, Volume 2.0x, Limiter 0.95
+   *   - Warm Armor: Dual identical in-phase c0=c0-c1 | c1=c0-c1 (mono-safe), Highpass 160Hz, Low-shelf Bass +3dB @ 180Hz, High-shelf -1dB @ 8kHz, Tempo 1.0x natural, Volume 1.8x, Limiter 0.95
    * Runs 100% locally in browser memory with zero network dependencies!
    */
   const renderArmorAudioLocally = async (
@@ -703,16 +709,17 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
     const preset = normalizePreset(presetId);
     const sampleRate = 44100;
+    const isPulse = preset === 'pulse_armor';
     const isWarm = preset === 'warm_armor';
     const rate = ARMOR_CONSTANTS.PITCH_SHIFT;
-    const tempoMultiplier = isWarm ? ARMOR_CONSTANTS.TEMPO_WARM : ARMOR_CONSTANTS.TEMPO_RESTORE;
+    const tempoMultiplier = isPulse ? ARMOR_CONSTANTS.TEMPO_PULSE : ARMOR_CONSTANTS.TEMPO_RESTORE;
 
     const availableSourceSecs = Math.max(0.5, sourceBuffer.duration - startOffset);
     const rawPlaySecs = isFull
       ? availableSourceSecs
       : Math.min(Math.max(1, targetDuration), availableSourceSecs);
 
-    const finalDurationSecs = isWarm ? rawPlaySecs / 1.05 : rawPlaySecs;
+    const finalDurationSecs = isPulse ? rawPlaySecs / 1.05 : rawPlaySecs;
     const totalFrames = Math.max(100, Math.ceil(finalDurationSecs * sampleRate));
 
     const OfflineCtxClass =
@@ -759,21 +766,16 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     // Filter stages according to technical spec
     const highpass = offlineCtx.createBiquadFilter();
     highpass.type = 'highpass';
-    highpass.frequency.value = isWarm ? 160 : 250;
+    highpass.frequency.value = isWarm ? 160 : isPulse ? 220 : 195;
 
     let chainOut: AudioNode = highpass;
 
-    if (preset === 'warm_armor') {
-      const bassBoost = offlineCtx.createBiquadFilter();
-      bassBoost.type = 'lowshelf';
-      bassBoost.frequency.value = 180;
-      bassBoost.gain.value = 3.0;
-
+    if (preset === 'pulse_armor') {
       const notch = offlineCtx.createBiquadFilter();
       notch.type = 'peaking';
       notch.frequency.value = 1800;
       notch.Q.value = 1.2;
-      notch.gain.value = -11.0;
+      notch.gain.value = -8.0;
 
       const tremoloGain = offlineCtx.createGain();
       tremoloGain.gain.value = 0.56;
@@ -789,14 +791,27 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       lfoGain.connect(tremoloGain.gain);
       lfo.start(0);
 
-      highpass.connect(bassBoost);
-      bassBoost.connect(notch);
+      highpass.connect(notch);
       notch.connect(tremoloGain);
       chainOut = tremoloGain;
+    } else if (preset === 'warm_armor') {
+      const bassBoost = offlineCtx.createBiquadFilter();
+      bassBoost.type = 'lowshelf';
+      bassBoost.frequency.value = 180;
+      bassBoost.gain.value = 3.0;
+
+      const highShelf = offlineCtx.createBiquadFilter();
+      highShelf.type = 'highshelf';
+      highShelf.frequency.value = 8000;
+      highShelf.gain.value = -1.0;
+
+      highpass.connect(bassBoost);
+      bassBoost.connect(highShelf);
+      chainOut = highShelf;
     }
 
     const volumeGain = offlineCtx.createGain();
-    volumeGain.gain.value = isWarm ? 2.2 : 1.6;
+    volumeGain.gain.value = isPulse ? 2.0 : isWarm ? 1.8 : 1.6;
     chainOut.connect(volumeGain);
 
     // Section 10.2: Peak Limiter 0.95
@@ -832,7 +847,8 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     setIsProcessing(true);
     setErrorMessage(null);
 
-    const targetDuration = durationMode === 'full' ? 0 : 60.0;
+    // Use 59.0s in slice mode so audio output duration is strictly under Suno's 60.00s cutoff
+    const targetDuration = durationMode === 'full' ? 0 : 59.0;
     const cleanTitle = (fileName || 'Audio_Seed')
       .replace(/\.[^/.]+$/, '')
       .replace(/[^a-zA-Z0-9_\-]/g, '_');
@@ -841,7 +857,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       cleanTitle,
       selectedPreset,
       durationMode === 'full',
-      targetDuration || 60.0,
+      targetDuration || 59.0,
       ext
     );
 
@@ -1443,12 +1459,12 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                 >
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold">MP3</span>
-                    <span className={`text-[8px] font-mono px-1 py-0.5 rounded ${armorFormat === 'mp3' ? 'bg-white/10 text-zinc-200' : 'bg-white/[0.06] text-zinc-400'}`}>
-                      HD
+                    <span className={`text-[8px] font-mono px-1 py-0.5 rounded ${armorFormat === 'mp3' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30' : 'bg-white/[0.06] text-zinc-400'}`}>
+                      SUNO READY
                     </span>
                   </div>
                   <div className={`text-[10px] font-mono ${armorFormat === 'mp3' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                    320 kbps
+                    320 kbps (100% Lolos)
                   </div>
                 </button>
               </div>

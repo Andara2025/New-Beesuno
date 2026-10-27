@@ -1,10 +1,10 @@
 import React from 'react';
-import { Volume2, Sparkles, ShieldCheck, Download, Plus, CheckCircle2 } from 'lucide-react';
+import { Volume2, Sparkles, ShieldCheck, Download, CheckCircle2 } from 'lucide-react';
 
 interface HeaderProps {
   activeTab: 'cloaker' | 'armor' | 'downloader' | 'remaster' | 'batch';
   setActiveTab: (tab: 'cloaker' | 'armor' | 'downloader' | 'remaster' | 'batch') => void;
-  onAddFileClick: () => void;
+  onAddFileClick?: () => void;
   currentTimeStr: string;
 }
 
@@ -41,20 +41,7 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Center Tabs - macOS Segmented Control */}
         <nav aria-label="Main Workflow" className="flex items-center bg-black/40 p-1 rounded-xl border border-white/[0.08] overflow-x-auto max-w-full scrollbar-none gap-1 shrink-0">
-          {/* Tab 1: Cloaker */}
-          <button
-            onClick={() => setActiveTab('cloaker')}
-            className={`flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all shrink-0 select-none ${
-              activeTab === 'cloaker'
-                ? 'bg-[#2c2e38] text-white font-medium shadow-sm border border-white/15'
-                : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]'
-            }`}
-          >
-            <Sparkles className="w-3.5 h-3.5 shrink-0" />
-            <span>1. Naskah Vokal</span>
-          </button>
-
-          {/* Tab 2: Armor */}
+          {/* Tab 1: Upload Armor */}
           <button
             onClick={() => setActiveTab('armor')}
             className={`flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all shrink-0 select-none ${
@@ -64,7 +51,20 @@ export const Header: React.FC<HeaderProps> = ({
             }`}
           >
             <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
-            <span>2. Upload Armor</span>
+            <span>1. Upload Armor</span>
+          </button>
+
+          {/* Tab 2: Naskah */}
+          <button
+            onClick={() => setActiveTab('cloaker')}
+            className={`flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all shrink-0 select-none ${
+              activeTab === 'cloaker'
+                ? 'bg-[#2c2e38] text-white font-medium shadow-sm border border-white/15'
+                : 'text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.04]'
+            }`}
+          >
+            <Sparkles className="w-3.5 h-3.5 shrink-0" />
+            <span>2. Naskah</span>
           </button>
 
           {/* Tab 3: Suno Downloader */}
@@ -80,7 +80,7 @@ export const Header: React.FC<HeaderProps> = ({
             <span>3. Downloader</span>
           </button>
 
-          {/* Tab 4: Remaster */}
+          {/* Tab 4: Remasterd */}
           <button
             onClick={() => setActiveTab('remaster')}
             className={`flex items-center gap-1.5 sm:gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all shrink-0 select-none ${
@@ -90,7 +90,7 @@ export const Header: React.FC<HeaderProps> = ({
             }`}
           >
             <Volume2 className="w-3.5 h-3.5 shrink-0" />
-            <span>4. Studio Remaster</span>
+            <span>4. Remasterd</span>
           </button>
         </nav>
 
@@ -99,15 +99,6 @@ export const Header: React.FC<HeaderProps> = ({
           <div className="hidden lg:block text-[11px] font-mono text-zinc-400">
             {currentTimeStr}
           </div>
-
-          <button
-            onClick={onAddFileClick}
-            className="flex items-center gap-1.5 bg-white/[0.08] hover:bg-white/[0.12] text-zinc-200 hover:text-white px-3 py-1.5 rounded-lg text-xs font-medium border border-white/[0.08] transition shadow-sm"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">Tambah File</span>
-            <span className="sm:hidden">+ File</span>
-          </button>
 
           <div className="w-7 h-7 rounded-full bg-white/[0.08] border border-white/10 flex items-center justify-center text-xs font-medium text-white">
             S

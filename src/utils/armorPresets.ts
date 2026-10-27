@@ -28,8 +28,9 @@ export interface ArmorPresetMeta {
 
 export const ARMOR_CONSTANTS = {
   PITCH_SHIFT: 0.8908987, // 2^(-2/12) -> transpose -2 semitones
-  TEMPO_RESTORE: 1.122462, // 1 / 0.8908987
-  TEMPO_WARM: 1.178585, // 1.122462 * 1.05 -> tempo +5%
+  TEMPO_RESTORE: 1.122462, // 1 / 0.8908987 -> tempo 1.0x (normal)
+  TEMPO_PULSE: 1.178585, // 1.122462 * 1.05 -> tempo +5% untuk Pulse
+  TEMPO_WARM: 1.122462, // 1.0× tempo asli natural untuk Warm
   SAMPLE_RATE: 44100,
 } as const;
 
@@ -41,15 +42,15 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     badge: 'VOKAL JELAS',
     accent: 'emerald',
     icon: '🛡️',
-    desc: 'Pembatalan komponen tengah stereo, low-cut 250 Hz, transpose -2 semitone',
+    desc: 'Atenuasi tengah terkalibrasi (k=0.88), low-cut 195 Hz, transpose -2 semitone',
     bestFor: ['Vokal Solo', 'Pop', 'Akustik', 'Cover Melodik'],
     suffix: '_VocalArmor',
     aliases: ['original', 'default', 'sideharmoni', 'side_harmony', 'side_harmonic'],
-    stereoBehavior: 'Anti-phase (L−R / R−L)',
-    monoDownmix: 'Silence (L - R null)',
+    stereoBehavior: 'Anti-phase terkalibrasi (k=0.88)',
+    monoDownmix: 'Vokal panduan samar aman',
     tempo: '1.0× (Normal)',
-    lowCutHz: 250,
-    tone: 'Terang, artikulatif',
+    lowCutHz: 195,
+    tone: 'Artikulatif halus, tetap lolos Suno',
   },
   pulse_armor: {
     id: 'pulse_armor',
@@ -58,15 +59,15 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     badge: 'DENYUT RITMIS',
     accent: 'amber',
     icon: '⚡',
-    desc: 'Atenuasi komponen tengah berdenyut, siklus 3 detik dengan ramp 50 ms',
+    desc: 'Atenuasi tengah termodulasi berdenyut, tremolo 5.5 Hz, tempo +5%, denyut ritmis energik',
     bestFor: ['Upbeat', 'Pop Modern', 'EDM', 'Dangdut', 'Rock'],
     suffix: '_PulseArmor',
     aliases: ['staccato', 'staccato_guide', 'pulse', 'rhythmic_chop'],
-    stereoBehavior: 'Atenuasi tengah bergantian k=0.78..1.00',
-    monoDownmix: 'Silence saat fase kill',
-    tempo: '1.0× (Normal)',
-    lowCutHz: 250,
-    tone: 'Berdenyut dinamis',
+    stereoBehavior: 'Atenuasi tengah bergantian + tremolo denyut 5.5 Hz',
+    monoDownmix: 'Silence saat fase kill / denyut dinamis',
+    tempo: '1.05× (+5% tempo)',
+    lowCutHz: 220,
+    tone: 'Berdenyut dinamis & cepat',
   },
   warm_armor: {
     id: 'warm_armor',
@@ -75,15 +76,15 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     badge: 'RESONANSI HANGAT',
     accent: 'violet',
     icon: '🌙',
-    desc: 'Pembatalan tengah in-phase, low-shelf +3 dB, notch 1.8 kHz, tremolo 5.5 Hz, tempo +5%',
+    desc: 'Resonansi analog hangat, low-shelf bass boost +3 dB @ 180 Hz, in-phase mono-safe tanpa getaran tremolo',
     bestFor: ['Ballad', 'Jazz', 'Lo-Fi', 'Akustik Santai'],
     suffix: '_WarmArmor',
     aliases: ['slow_tempo', 'slow_ballad', 'ballad', 'slow', 'deep_acoustic'],
     stereoBehavior: 'In-phase dual identical (mono-safe)',
-    monoDownmix: 'Aman (mono terdengar)',
-    tempo: '1.05× (+5% tempo)',
+    monoDownmix: 'Aman (mono terdengar hangat)',
+    tempo: '1.0× (Normal)',
     lowCutHz: 160,
-    tone: 'Tebal, hangat, empuk',
+    tone: 'Tebal, hangat, empuk, santai',
   },
 };
 
@@ -129,10 +130,14 @@ export function buildArmorOutputFilename(
   durationSec: number,
   ext: string = 'mp3'
 ): string {
-  const base = (rawTitle || 'Audio')
+  let base = (rawTitle || 'Audio')
     .replace(/\.[^/.]+$/, '')
     .replace(/[^a-zA-Z0-9_\-]/g, '_')
     .replace(/_+/g, '_');
+
+  if (base.length > 40) {
+    base = base.substring(0, 40).replace(/_$/, '');
+  }
 
   const meta = getPresetMeta(rawPreset);
   const durLabel = isFull ? 'Full' : `${Math.round(durationSec)}s`;

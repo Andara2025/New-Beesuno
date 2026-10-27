@@ -12,7 +12,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+// AI Studio dev server must run on port 3000 (port 8080 is reserved by nginx proxy)
+const PORT = 3000;
 
 // Enable CORS and handle preflight OPTIONS globally
 app.use((req, res, next) => {
@@ -830,20 +831,24 @@ async function runArmorFFmpeg(
     const args: string[] = ['-y'];
 
     if (!isFull) {
-      args.push('-ss', startTime.toFixed(3), '-t', duration.toFixed(3));
+      // 59.0s safe duration ensures the output file with MP3/Vorbis encoder delay & frame padding
+      // never exceeds 59.5 seconds, strictly under Suno's 60.00-second upload threshold!
+      const safeDuration = duration >= 59.0 && duration <= 60.5 ? 59.0 : duration;
+      args.push('-ss', startTime.toFixed(3), '-t', safeDuration.toFixed(3));
     }
 
     args.push('-i', tempInput, '-vn', '-af', dspFilter, '-map_metadata', '-1');
+    args.push('-avoid_negative_ts', 'make_zero', '-fflags', '+genpts');
 
     if (format === 'wav') {
       // 16-bit uncompressed PCM: 100% immune to Suno AI verification check timeout
       args.push('-c:a', 'pcm_s16le', '-f', 'wav', tempOutput);
     } else if (format === 'ogg') {
-      // Vorbis 192k compact bitrate
-      args.push('-c:a', 'libvorbis', '-b:a', '192k', '-f', 'ogg', tempOutput);
+      // Vorbis 128k compact bitrate with normalized timestamps (under 1MB, avoids network timeout)
+      args.push('-c:a', 'libvorbis', '-b:a', '128k', '-f', 'ogg', tempOutput);
     } else {
-      // MP3 320k CBR
-      args.push('-c:a', 'libmp3lame', '-b:a', '320k', '-f', 'mp3', tempOutput);
+      // MP3 192k compact CBR (< 1.4MB fast upload) with clean standard ID3v2.3 tag
+      args.push('-c:a', 'libmp3lame', '-b:a', '192k', '-id3v2_version', '3', '-f', 'mp3', tempOutput);
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -977,8 +982,8 @@ const handleArmorPreview = async (req: express.Request, res: express.Response) =
     const preset = normalizeArmorPreset(rawPreset);
     const startTime = parseFloat((req.query.startTime as string) || '0');
     const duration = Math.min(30, parseFloat((req.query.duration as string) || '20'));
-    const rawFormat = ((req.query.format as string) || (req.headers['x-armor-format'] as string) || 'ogg').toLowerCase();
-    const format: ArmorFormatType = rawFormat === 'mp3' ? 'mp3' : rawFormat === 'wav' ? 'wav' : 'ogg';
+    const rawFormat = ((req.query.format as string) || (req.headers['x-armor-format'] as string) || 'mp3').toLowerCase();
+    const format: ArmorFormatType = rawFormat === 'ogg' ? 'ogg' : rawFormat === 'wav' ? 'wav' : 'mp3';
 
     const result = await runArmorFFmpeg(audioBuffer, {
       preset,

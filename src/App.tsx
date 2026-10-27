@@ -32,7 +32,7 @@ import { PresetsModal } from './components/PresetsModal';
 import { FooterBar } from './components/FooterBar';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'cloaker' | 'armor' | 'downloader' | 'remaster' | 'batch'>('remaster');
+  const [activeTab, setActiveTab] = useState<'cloaker' | 'armor' | 'downloader' | 'remaster' | 'batch'>('armor');
   const [currentStep, setCurrentStep] = useState<number>(1); // Default to Step 1: Input Audio
   const [selectedFormat, setSelectedFormat] = useState<AudioFormat>('mp3');
   const [preset, setPreset] = useState<MasteringPreset>(MASTERING_PRESETS[0]);
@@ -327,12 +327,12 @@ export default function App() {
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-6 py-6">
-        {activeTab === 'cloaker' ? (
-          /* Tab 1: Stealth Lyrics Cloaker */
-          <LyricsCloakerView />
-        ) : activeTab === 'armor' ? (
-          /* Tab 2: Suno Upload Armor */
+        {activeTab === 'armor' ? (
+          /* Tab 1: Suno Upload Armor */
           <SunoUploadArmorView onNavigateTab={(tab) => setActiveTab(tab)} />
+        ) : activeTab === 'cloaker' ? (
+          /* Tab 2: Stealth Lyrics Cloaker / Naskah */
+          <LyricsCloakerView />
         ) : activeTab === 'downloader' ? (
           /* Tab 3: Suno Song Downloader & Decryptor */
           <SunoDownloaderView
@@ -346,7 +346,7 @@ export default function App() {
             }}
           />
         ) : (
-          /* Tab 4: Studio Remaster */
+          /* Tab 4: Studio Remasterd */
           <div>
             {/* Top Hero Stats Banner */}
             <HeroStats
