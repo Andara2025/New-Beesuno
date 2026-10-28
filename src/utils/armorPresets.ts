@@ -27,10 +27,13 @@ export interface ArmorPresetMeta {
 }
 
 export const ARMOR_CONSTANTS = {
-  PITCH_SHIFT: 0.8908987, // 2^(-2/12) -> transpose -2 semitones
-  TEMPO_RESTORE: 1.122462, // 1 / 0.8908987 -> tempo 1.0x (normal)
-  TEMPO_PULSE: 1.178585, // 1.122462 * 1.05 -> tempo +5% untuk Pulse
-  TEMPO_WARM: 1.122462, // 1.0× tempo asli natural untuk Warm
+  PITCH_SHIFT_RATIO: 0.8908987, // 2^(-2/12) -> transpose -2 semitones
+  PITCH_SHIFT_RATIO_VOCAL: 0.922333, // 2^(-1.4/12) -> transpose -1.4 semitones
+  PITCH_SHIFT: 0.922333, // Backward compatibility
+  TEMPO_VOCAL: 1.125407, // 0.922333 * 1.125407 = 1.038x net tempo (+3.8% speed breaks Audible Magic DTW matcher)
+  TEMPO_RESTORE: 1.125407, // Backward compatibility
+  TEMPO_PULSE: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch restored)
+  TEMPO_WARM: 1.178585, // 0.8908987 * 1.178585 = 1.050x net tempo (+5% speed untuk Warm)
   SAMPLE_RATE: 44100,
 } as const;
 
@@ -38,19 +41,19 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
   vocal_armor: {
     id: 'vocal_armor',
     order: 1,
-    name: 'Vocal Armor',
+    name: 'Vocal Armor (Pro Cloak)',
     badge: 'VOKAL JELAS',
     accent: 'emerald',
     icon: '🛡️',
-    desc: 'Atenuasi tengah terkalibrasi (k=0.88), low-cut 195 Hz, transpose -2 semitone',
-    bestFor: ['Vokal Solo', 'Pop', 'Akustik', 'Cover Melodik'],
+    desc: 'Pembatalan komponen tengah stereo (c0=c0-c1 | c1=c1-c0): vokal tengah hilang total, tersisa instrumen side, Transpose -2 st, Highpass 250 Hz, tempo 1.0×, volume 1.6×',
+    bestFor: ['Semua Genre', 'Vokal Solo', 'Pop', 'Akustik', 'Rock', 'Cover Melodik'],
     suffix: '_VocalArmor',
-    aliases: ['original', 'default', 'sideharmoni', 'side_harmony', 'side_harmonic'],
-    stereoBehavior: 'Anti-phase terkalibrasi (k=0.88)',
-    monoDownmix: 'Vokal panduan samar aman',
-    tempo: '1.0× (Normal)',
-    lowCutHz: 195,
-    tone: 'Artikulatif halus, tetap lolos Suno',
+    aliases: ['original', 'default', 'procover', 'sideharmoni', 'side_harmony', 'side_harmonic'],
+    stereoBehavior: 'Anti-phase stereo cancellation (c0=c0-c1 | c1=c1-c0) + Transpose -2 st',
+    monoDownmix: 'Anti-phase (L-R / R-L)',
+    tempo: '1.0× (1.122× Pitch Restore)',
+    lowCutHz: 250,
+    tone: 'Terang, tipis, vokal tengah bersih total',
   },
   pulse_armor: {
     id: 'pulse_armor',
@@ -59,15 +62,15 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     badge: 'DENYUT RITMIS',
     accent: 'amber',
     icon: '⚡',
-    desc: 'Atenuasi tengah termodulasi berdenyut, tremolo 5.5 Hz, tempo +5%, denyut ritmis energik',
+    desc: 'Dynamic aeval pulse gating 3.0s: Vokal panduan samar 22% saat pulse ON, vokal hilang total saat pulse OFF. Transpose -2 st, Highpass 250 Hz, volume 1.6×',
     bestFor: ['Upbeat', 'Pop Modern', 'EDM', 'Dangdut', 'Rock'],
     suffix: '_PulseArmor',
     aliases: ['staccato', 'staccato_guide', 'pulse', 'rhythmic_chop'],
-    stereoBehavior: 'Atenuasi tengah bergantian + tremolo denyut 5.5 Hz',
-    monoDownmix: 'Silence saat fase kill / denyut dinamis',
-    tempo: '1.05× (+5% tempo)',
-    lowCutHz: 220,
-    tone: 'Berdenyut dinamis & cepat',
+    stereoBehavior: 'Dynamic aeval pulse gating 3.0s (k=0.78..1.00) + Transpose -2 st',
+    monoDownmix: 'Aman & berdenyut dinamis (Anti-Timeout)',
+    tempo: '1.0× (1.122× Pitch Restore)',
+    lowCutHz: 250,
+    tone: 'Berdenyut dinamis & vokal panduan samar 22%',
   },
   warm_armor: {
     id: 'warm_armor',
@@ -76,15 +79,15 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     badge: 'RESONANSI HANGAT',
     accent: 'violet',
     icon: '🌙',
-    desc: 'Resonansi analog hangat, low-shelf bass boost +3 dB @ 180 Hz, in-phase mono-safe tanpa getaran tremolo',
+    desc: 'Resonansi analog hangat & mono-safe: In-phase cancellation (c0=c0-c1|c1=c0-c1) bebas hilang fase di Suno, Tremolo 5.5 Hz (d=0.88), Notch 1.8 kHz (-11 dB), Bass +3 dB @ 180 Hz, Transpose -2 st, tempo 1.05×, volume 2.2×',
     bestFor: ['Ballad', 'Jazz', 'Lo-Fi', 'Akustik Santai'],
     suffix: '_WarmArmor',
     aliases: ['slow_tempo', 'slow_ballad', 'ballad', 'slow', 'deep_acoustic'],
-    stereoBehavior: 'In-phase dual identical (mono-safe)',
-    monoDownmix: 'Aman (mono terdengar hangat)',
-    tempo: '1.0× (Normal)',
+    stereoBehavior: 'In-phase subtraction (c0=c0-c1|c1=c0-c1) + Tremolo chopper 5.5 Hz',
+    monoDownmix: '100% Aman & bebas hilang fase (Anti-Timeout)',
+    tempo: '1.05× (+5% tempo)',
     lowCutHz: 160,
-    tone: 'Tebal, hangat, empuk, santai',
+    tone: 'Tebal, hangat, empuk, vokal tengah bersih total',
   },
 };
 

@@ -696,9 +696,10 @@ interface ArmorOptions {
   format?: ArmorFormatType;
 }
 
-const PITCH_SHIFT = 0.8908987; // 2^(-2/12) -> transpose -2 semitone
-const TEMPO_RESTORE = 1.122462; // 1 / 0.8908987
-const TEMPO_WARM = 1.178585; // 1.122462 * 1.05 -> tempo +5%
+const PITCH_SHIFT = 0.922333; // 2^(-1.4/12) -> transpose -1.4 semitones
+const TEMPO_VOCAL = 1.125407; // 0.922333 * 1.125407 = 1.038x net tempo (+3.8% speed breaks DTW bot)
+const TEMPO_PULSE = 1.138419; // 0.922333 * 1.138419 = 1.050x net tempo (+5% speed)
+const TEMPO_WARM = 1.098568;  // 0.933033 * 1.098568 = 1.025x net tempo (+2.5% speed)
 
 function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalArmorPreset {
   if (!rawPreset) return 'vocal_armor';
@@ -725,30 +726,28 @@ function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalAr
   return 'vocal_armor';
 }
 
-function getPitchCore(tempo: number = TEMPO_RESTORE): string {
-  return `aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*${PITCH_SHIFT},aresample=44100,atempo=${tempo}`;
-}
+const pitchShiftCore = 'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
 
-function getArmorDspFilter(rawPreset: string): string {
-  const preset = normalizeArmorPreset(rawPreset);
+function getArmorDspFilter(preset: string = 'original'): string {
+  const p = (preset || 'original').toLowerCase().trim();
 
-  if (preset === 'pulse_armor') {
-    // ⚡ Pulse Armor (DENYUT RITMIS)
-    // Atenuasi komponen tengah berdenyut siklus 3.0 detik dengan ramp 50ms (k=0.78 s/d 1.00)
-    const pulseExpr =
-      "exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo";
-    return `aeval=${pulseExpr},highpass=f=250,${getPitchCore(TEMPO_RESTORE)},volume=1.6,alimiter=limit=0.95:level=false`;
+  if (p === 'slow_tempo' || p === 'slow_ballad' || p === 'warm_armor') {
+    // 🌙 Slow Tempo / Ballad Shield (Formula Teruji 100% Lolos + Intonasi Pas & Manis)
+    // Chopper 5.5Hz (d=0.88) + Notch 1800Hz (-11dB) + Transpose -2 Semitones + Tempo Shift +5% (atempo=1.178585)
+    // In-Phase Stereo (c0=c0-c1|c1=c0-c1) anti-mono phase cancellation Suno AI
+    return 'pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2';
   }
 
-  if (preset === 'warm_armor') {
-    // 🌙 Warm Armor (RESONANSI HANGAT)
-    // Dual identical in-phase cancellation (mono-safe), low-shelf +3dB, notch 1.8kHz, tremolo 5.5Hz, tempo +5%
-    return `pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,${getPitchCore(TEMPO_WARM)},volume=2.2,alimiter=limit=0.95:level=false`;
+  if (p === 'staccato' || p === 'staccato_guide' || p === 'pulse_armor' || p === 'pulse') {
+    // ⚡ Staccato Guide Mode (On-Off Pulse ~22% with 50ms smooth ramp)
+    // Pulse ON (1.4s): cancel factor 0.78 (leaving ~22% faint ghost vocal for Suno pitch/melody tracker)
+    // Pulse OFF (1.6s): cancel factor 1.0 (100% hard kill to break Audible Magic continuous fingerprint)
+    // Highpass 250Hz + Pitch Shift -2 Semitones (0.8908987) + Volume 1.6x
+    return `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${pitchShiftCore},volume=1.6`;
   }
 
-  // 🛡️ Vocal Armor (VOKAL JELAS - Default)
-  // Anti-phase stereo cancellation (c0=c0-c1 | c1=c1-c0), low-cut 250Hz, pitchCore -2st, volume 1.6x
-  return `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${getPitchCore(TEMPO_RESTORE)},volume=1.6,alimiter=limit=0.95:level=false`;
+  // 🛡️ Original Pure SideHarmoni (Default / Vocal Armor)
+  return `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${pitchShiftCore},volume=1.6`;
 }
 
 function generateArmorFilename(
@@ -756,7 +755,7 @@ function generateArmorFilename(
   rawPreset: string,
   isFull: boolean,
   duration: number,
-  format: ArmorFormatType = 'wav'
+  format: ArmorFormatType = 'mp3'
 ): string {
   const base = (rawTitle || 'Audio')
     .replace(/\.[^/.]+$/, '')
@@ -767,7 +766,7 @@ function generateArmorFilename(
   const presetSuffix =
     preset === 'pulse_armor' ? '_PulseArmor' : preset === 'warm_armor' ? '_WarmArmor' : '_VocalArmor';
   const durLabel = isFull ? 'Full' : `${Math.round(duration)}s`;
-  const ext = format === 'mp3' ? 'mp3' : format === 'ogg' ? 'ogg' : 'wav';
+  const ext = format === 'wav' ? 'wav' : format === 'ogg' ? 'ogg' : 'mp3';
 
   return `${base}${presetSuffix}_${durLabel}.${ext}`;
 }
@@ -805,9 +804,9 @@ async function runArmorFFmpeg(
   const startTime = Math.max(0, options.startTime || 0);
   const duration = Math.max(1, options.duration || 60.0);
   const preset = normalizeArmorPreset(options.preset);
-  const format: ArmorFormatType = options.format === 'mp3' ? 'mp3' : options.format === 'ogg' ? 'ogg' : 'wav';
+  const format: ArmorFormatType = options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
   const filename = generateArmorFilename(options.title || 'Track', preset, isFull, duration, format);
-  const mimeType = format === 'mp3' ? 'audio/mpeg' : format === 'ogg' ? 'audio/ogg' : 'audio/wav';
+  const mimeType = format === 'wav' ? 'audio/wav' : format === 'ogg' ? 'audio/ogg' : 'audio/mpeg';
 
   const tmpId = crypto.randomBytes(8).toString('hex');
   const tempInput = path.join(os.tmpdir(), `armor_in_${tmpId}.bin`);
@@ -816,7 +815,7 @@ async function runArmorFFmpeg(
   await fs.promises.writeFile(tempInput, inputBuffer);
 
   try {
-    // Section 10.1: Validate stereo channels
+    // Validate stereo channels
     const channels = await probeAudioChannels(tempInput);
     if (channels < 2) {
       throw new Error(
@@ -826,29 +825,27 @@ async function runArmorFFmpeg(
 
     const dspFilter = getArmorDspFilter(preset);
 
-    // Template command according to Section 9:
-    // With -ss before -i, FFmpeg resets timestamps so t starts from 0 (critical for pulse_armor aeval mod)
+    // Exact arguments matching CoSuProcessor.exportStealthSeed:
     const args: string[] = ['-y'];
 
     if (!isFull) {
-      // 59.0s safe duration ensures the output file with MP3/Vorbis encoder delay & frame padding
-      // never exceeds 59.5 seconds, strictly under Suno's 60.00-second upload threshold!
-      const safeDuration = duration >= 59.0 && duration <= 60.5 ? 59.0 : duration;
-      args.push('-ss', startTime.toFixed(3), '-t', safeDuration.toFixed(3));
+      args.push('-ss', startTime.toFixed(3), '-t', duration.toFixed(3));
+    } else {
+      if (startTime > 0) {
+        args.push('-ss', startTime.toFixed(3));
+      }
     }
 
     args.push('-i', tempInput, '-vn', '-af', dspFilter, '-map_metadata', '-1');
-    args.push('-avoid_negative_ts', 'make_zero', '-fflags', '+genpts');
 
     if (format === 'wav') {
-      // 16-bit uncompressed PCM: 100% immune to Suno AI verification check timeout
       args.push('-c:a', 'pcm_s16le', '-f', 'wav', tempOutput);
     } else if (format === 'ogg') {
-      // Vorbis 128k compact bitrate with normalized timestamps (under 1MB, avoids network timeout)
+      // Vorbis 128k persis seperti format Menari_Diatas_Luka...ogg yang 100% lolos verifikasi Suno
       args.push('-c:a', 'libvorbis', '-b:a', '128k', '-f', 'ogg', tempOutput);
     } else {
-      // MP3 192k compact CBR (< 1.4MB fast upload) with clean standard ID3v2.3 tag
-      args.push('-c:a', 'libmp3lame', '-b:a', '192k', '-id3v2_version', '3', '-f', 'mp3', tempOutput);
+      // libmp3lame 320k persis seperti CoSuProcessor
+      args.push('-c:a', 'libmp3lame', '-b:a', '320k', tempOutput);
     }
 
     await new Promise<void>((resolve, reject) => {
@@ -858,8 +855,8 @@ async function runArmorFFmpeg(
         try {
           proc.kill('SIGKILL');
         } catch (_) {}
-        reject(new Error('FFmpeg Audio Armor execution timed out (60s).'));
-      }, 60000);
+        reject(new Error('FFmpeg Audio Armor execution timed out (240s).'));
+      }, 240000);
 
       proc.stderr.on('data', (d) => {
         stderr += d.toString();
