@@ -35,6 +35,11 @@ import {
   getTempoArmorK,
   ARMOR_CONSTANTS,
   ArmorPresetMeta,
+  StereoBoostMode,
+  StereoProfileDiagnostics,
+  analyzeAudioBufferStereoProfile,
+  shouldApplyStereoBoost,
+  applyTrueStereoPreConditionerToChannels,
 } from '../utils/armorPresets';
 import {
   processSunoUploadArmor,
@@ -54,6 +59,8 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   // Preset & Processing Options
   const [selectedPreset, setSelectedPreset] = useState<CanonicalArmorPresetId>(DEFAULT_ARMOR_PRESET);
   const [tempoShiftPercent, setTempoShiftPercent] = useState<number>(ARMOR_CONSTANTS.TEMPO_SLOWEST_DEFAULT);
+  const [stereoBoostMode, setStereoBoostMode] = useState<StereoBoostMode>('force_off');
+  const [stereoDiagnostics, setStereoDiagnostics] = useState<StereoProfileDiagnostics | null>(null);
   const [durationMode, setDurationMode] = useState<'full' | '60s' | 'custom'>('full');
   const [customDuration, setCustomDuration] = useState<number>(60);
   const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('mp3');
@@ -109,7 +116,25 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioBlobUrlRef = useRef<string | null>(null);
   const lfoNodeRef = useRef<OscillatorNode | null>(null);
-  const pulseBufferCacheRef = useRef<{ source: AudioBuffer; processed: AudioBuffer } | null>(null);
+  const pulseBufferCacheRef = useRef<{
+    source: AudioBuffer;
+    stereoBoosted: boolean;
+    processed: AudioBuffer;
+    tempoVocal: AudioBuffer;
+    pitched: AudioBuffer;
+  } | null>(null);
+
+  // Automatically analyze stereo profile whenever audioBuffer changes
+  useEffect(() => {
+    if (audioBuffer) {
+      try {
+        const diag = analyzeAudioBufferStereoProfile(audioBuffer);
+        setStereoDiagnostics(diag);
+      } catch (e) {
+        console.warn('Stereo analysis error:', e);
+      }
+    }
+  }, [audioBuffer]);
 
   // Load Initial Demo Audio
   useEffect(() => {
@@ -163,23 +188,20 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     startOffset = 0,
     presetOverride?: CanonicalArmorPresetId,
     modeOverride?: 'armor' | 'original',
-    tempoShiftOverride?: number
+    tempoShiftOverride?: number,
+    stereoBoostModeOverride?: StereoBoostMode
   ) => {
     if (!audioBuffer) return;
     // Keep playing state active so UI doesn't flicker during seamless seek
     stopLocalPlayback(true);
 
-    // Section 10.1: Stereo channel validation
-    if (audioBuffer.numberOfChannels < 2) {
-      setErrorMessage(
-        'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja secara efektif. Mohon gunakan berkas audio stereo.'
-      );
-      return;
-    }
-
     const activeMode = modeOverride !== undefined ? modeOverride : abMode;
     const activePreset = normalizePreset(presetOverride !== undefined ? presetOverride : selectedPreset);
     const activeTempoShift = tempoShiftOverride !== undefined ? tempoShiftOverride : tempoShiftPercent;
+    const activeBoostMode = stereoBoostModeOverride !== undefined ? stereoBoostModeOverride : stereoBoostMode;
+    const currentDiag = stereoDiagnostics || analyzeAudioBufferStereoProfile(audioBuffer);
+    const activeStereoBoost =
+      audioBuffer.numberOfChannels < 2 || shouldApplyStereoBoost(activeBoostMode, currentDiag);
 
     const ctx = getAudioContext();
     audioContextRef.current = ctx;
@@ -218,12 +240,22 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       // Ensure cached -2 semitones (-200 cents) pitch-shifted base & pulse buffers for instant 1.0x tempo preview
       if (
         !pulseBufferCacheRef.current ||
-        pulseBufferCacheRef.current.source !== audioBuffer
+        pulseBufferCacheRef.current.source !== audioBuffer ||
+        pulseBufferCacheRef.current.stereoBoosted !== activeStereoBoost
       ) {
         const numSamples = audioBuffer.length;
         const sr = audioBuffer.sampleRate;
-        const inL = audioBuffer.getChannelData(0);
-        const inR = audioBuffer.getChannelData(1);
+        const rawL = audioBuffer.getChannelData(0);
+        const rawR = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : rawL;
+
+        let inL: Float32Array = rawL;
+        let inR: Float32Array = rawR;
+
+        if (activeStereoBoost) {
+          const pre = applyTrueStereoPreConditionerToChannels(rawL, rawR, sr);
+          inL = pre.outL;
+          inR = pre.outR;
+        }
 
         // Shift L and R by -200 cents (-2 semitones) while keeping 1.0x duration/tempo
         const shiftedL = applyTimeDomainPitchShift(inL, -200, sr);
@@ -254,18 +286,14 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
         pulseBufferCacheRef.current = {
           source: audioBuffer,
+          stereoBoosted: activeStereoBoost,
           processed: staccatoBuffer,
           tempoVocal: tempoVocalBuffer,
           pitched: pitchedStereo,
-        } as any;
+        };
       }
 
-      const cache = pulseBufferCacheRef.current as unknown as {
-        source: AudioBuffer;
-        processed: AudioBuffer;
-        tempoVocal: AudioBuffer;
-        pitched: AudioBuffer;
-      };
+      const cache = pulseBufferCacheRef.current;
 
       let chainOut: AudioNode;
 
@@ -537,7 +565,16 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     setSelectedPreset(presetId);
     if (isPlaying) {
       const cur = currentTime;
-      startLocalPlayback(cur, presetId, abMode, tempoShiftPercent);
+      startLocalPlayback(cur, presetId, abMode, tempoShiftPercent, stereoBoostMode);
+    }
+  };
+
+  // Handle Stereo Boost Mode Switch with Instant Live DSP Transition
+  const handleStereoBoostModeChange = (newMode: StereoBoostMode) => {
+    setStereoBoostMode(newMode);
+    if (isPlaying) {
+      const cur = currentTime;
+      startLocalPlayback(cur, selectedPreset, abMode, tempoShiftPercent, newMode);
     }
   };
 
@@ -769,12 +806,6 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     targetDuration: number,
     isFull: boolean
   ): Promise<AudioBuffer> => {
-    if (sourceBuffer.numberOfChannels < 2) {
-      throw new Error(
-        'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja. Silakan gunakan berkas audio stereo.'
-      );
-    }
-
     const preset = normalizePreset(presetId);
     const isPulse = preset === 'pulse_armor';
     const isWarm = preset === 'warm_armor';
@@ -795,8 +826,24 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
     const offlineCtx = new OfflineAudioContext(2, outLength, sr);
     const phaseBuffer = offlineCtx.createBuffer(2, sliceLen, sr);
-    const inL = sourceBuffer.getChannelData(0).subarray(startSample, startSample + sliceLen);
-    const inR = sourceBuffer.getChannelData(1).subarray(startSample, startSample + sliceLen);
+    const rawL = sourceBuffer.getChannelData(0).subarray(startSample, startSample + sliceLen);
+    const rawR =
+      sourceBuffer.numberOfChannels > 1
+        ? sourceBuffer.getChannelData(1).subarray(startSample, startSample + sliceLen)
+        : rawL;
+
+    const currentDiag = stereoDiagnostics || analyzeAudioBufferStereoProfile(sourceBuffer);
+    const applyStereoBoost =
+      sourceBuffer.numberOfChannels < 2 || shouldApplyStereoBoost(stereoBoostMode, currentDiag);
+
+    let inL: Float32Array = rawL;
+    let inR: Float32Array = rawR;
+    if (applyStereoBoost) {
+      const pre = applyTrueStereoPreConditionerToChannels(rawL, rawR, sr);
+      inL = pre.outL;
+      inR = pre.outR;
+    }
+
     const rawCh0 = new Float32Array(sliceLen);
     const rawCh1 = new Float32Array(sliceLen);
 
@@ -919,10 +966,15 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     try {
       const payloadBlob = await getAudioPayload();
       const presetMeta = getPresetMeta(selectedPreset);
+      const isStereoBoostActive =
+        (audioBuffer && audioBuffer.numberOfChannels < 2) ||
+        shouldApplyStereoBoost(stereoBoostMode, stereoDiagnostics);
       const queryParams = new URLSearchParams({
         preset: presetMeta.cosuKey,
         startTime: startTime.toFixed(3),
         duration: '15.00',
+        tempoShift: tempoShiftPercent.toString(),
+        stereoBoost: isStereoBoostActive ? 'true' : 'false',
         responseType: 'dataUri',
       });
 
@@ -976,6 +1028,9 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       targetDuration || 60.0,
       ext
     );
+    const isStereoBoostActive =
+      (audioBuffer && audioBuffer.numberOfChannels < 2) ||
+      shouldApplyStereoBoost(stereoBoostMode, stereoDiagnostics);
 
     try {
       let blob: Blob | null = null;
@@ -993,6 +1048,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             title: cleanTitle,
             format: armorFormat,
             tempoShift: tempoShiftPercent.toString(),
+            stereoBoost: isStereoBoostActive ? 'true' : 'false',
           });
 
           const controller = new AbortController();
@@ -1018,16 +1074,10 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             const errJson = await response.json().catch(() => null);
             if (errJson && errJson.error) {
               console.warn('Server FFmpeg returned error:', errJson.error);
-              if (errJson.error.includes('Mono')) {
-                throw new Error(errJson.error);
-              }
             }
           }
         }
       } catch (fetchErr: any) {
-        if (fetchErr && fetchErr.message && fetchErr.message.includes('Mono')) {
-          throw fetchErr;
-        }
         // Network or fetch failed - smoothly continue to client-side DSP
         console.info('Server processing skipped, rendering via high-precision in-browser DSP:', fetchErr);
       }
@@ -1296,6 +1346,59 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             </button>
           </div>
         )}
+      </div>
+
+      {/* Vocal & Stereo Mode Control Bar */}
+      <div className="bg-[#14151b] border border-white/[0.08] rounded-2xl p-4 sm:p-5 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        <div className="space-y-1 min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Radio className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span className="text-xs sm:text-sm font-semibold text-white">
+              Mode Isolasi Fase & Reduksi Vokal
+            </span>
+            {stereoDiagnostics && (
+              <span
+                className={`text-xs font-mono tabular-nums px-2 py-0.5 rounded border ${
+                  shouldApplyStereoBoost(stereoBoostMode, stereoDiagnostics)
+                    ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                    : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/30'
+                }`}
+              >
+                {stereoDiagnostics.statusLabel}
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-zinc-400 leading-relaxed">
+            {stereoDiagnostics
+              ? stereoDiagnostics.detailLabel
+              : 'Mode Murni (Default) menjaga pencabutan vokal tengah 100% utuh tanpa efek delay. Gunakan Reduksi Vokal Ekstra jika vokal di lagu masih terlalu kuat.'}
+          </p>
+        </div>
+
+        {/* Mode Segmented Switch */}
+        <div className="flex items-center bg-black/40 p-1 rounded-xl border border-white/[0.08] shrink-0 self-start lg:self-center">
+          {[
+            { id: 'force_off' as StereoBoostMode, label: 'Murni (Default ★)' },
+            { id: 'auto' as StereoBoostMode, label: 'Auto Mono' },
+            { id: 'force_on' as StereoBoostMode, label: 'Reduksi Vokal Ekstra' },
+          ].map((opt) => {
+            const active = stereoBoostMode === opt.id;
+            return (
+              <button
+                key={opt.id}
+                type="button"
+                onClick={() => handleStereoBoostModeChange(opt.id)}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium transition whitespace-nowrap shrink-0 ${
+                  active
+                    ? 'bg-[#2c2e38] text-white shadow-sm border border-white/15'
+                    : 'text-zinc-400 hover:text-zinc-200'
+                }`}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       {/* Preset Selector Cards */}
@@ -1819,8 +1922,17 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
                 <span className="text-zinc-400">Mode Stereo:</span>
-                <span className="font-medium text-zinc-300">
+                <span className="font-medium text-zinc-300 text-right">
                   {activePresetObj.stereoBehavior}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
+                <span className="text-zinc-400">Filter Vokal:</span>
+                <span className="font-mono tabular-nums font-medium text-emerald-300 text-right">
+                  {shouldApplyStereoBoost(stereoBoostMode, stereoDiagnostics)
+                    ? 'Reduksi Vokal Ekstra (-11 dB)'
+                    : 'Murni (Standar ★)'}
                 </span>
               </div>
 

@@ -226,3 +226,166 @@ export function getTempoArmorK(t: number): number {
   }
   return 0.78;
 }
+
+export type StereoBoostMode = 'auto' | 'force_on' | 'force_off';
+
+export interface StereoProfileDiagnostics {
+  channels: number;
+  midRmsDb: number;
+  sideRmsDb: number;
+  sideToMidDiffDb: number;
+  status: 'mono_1ch' | 'dual_mono' | 'narrow_vocal' | 'true_stereo';
+  needsStereoBoost: boolean;
+  statusLabel: string;
+  detailLabel: string;
+}
+
+export const TRUE_STEREO_PRE_CONDITIONER_FFMPEG =
+  'aformat=channel_layouts=stereo,pan=stereo|c0=0.60*c0|c1=0.40*c1,equalizer=f=1150:t=q:w=1.1:g=-12,equalizer=f=2450:t=q:w=1.1:g=-12';
+
+/**
+ * Analyzes an AudioBuffer to determine whether it is 1-channel Mono, Dual-Mono (L=R),
+ * or True Stereo.
+ */
+export function analyzeAudioBufferStereoProfile(buffer: AudioBuffer): StereoProfileDiagnostics {
+  const channels = buffer.numberOfChannels;
+  const sr = buffer.sampleRate || 44100;
+  const totalLen = buffer.length;
+
+  if (channels < 2 || totalLen === 0) {
+    return {
+      channels: Math.max(1, channels),
+      midRmsDb: -14.0,
+      sideRmsDb: -100.0,
+      sideToMidDiffDb: -86.0,
+      status: 'mono_1ch',
+      needsStereoBoost: true,
+      statusLabel: 'Mono (1 Kanal) · Reduksi Vokal Aktif',
+      detailLabel: 'Audio 1-kanal otomatis direduksi frekuensi vokalnya (-12 dB) tanpa efek delay agar vokal tetap samar seperti mode Murni.',
+    };
+  }
+
+  const ch0 = buffer.getChannelData(0);
+  const ch1 = buffer.getChannelData(1);
+
+  const startIdx = totalLen > sr * 15 ? Math.floor(totalLen * 0.12) : 0;
+  const windowSamples = Math.min(totalLen - startIdx, sr * 25);
+
+  let sumMidSq = 0;
+  let sumSideSq = 0;
+  const step = Math.max(1, Math.floor(sr / 11025));
+  let count = 0;
+
+  for (let i = startIdx; i < startIdx + windowSamples; i += step) {
+    const l = ch0[i];
+    const r = ch1[i];
+    const m = 0.5 * (l + r);
+    const s = 0.5 * (l - r);
+
+    sumMidSq += m * m;
+    sumSideSq += s * s;
+    count++;
+  }
+
+  const rmsMid = count > 0 ? Math.sqrt(sumMidSq / count) : 0;
+  const rmsSide = count > 0 ? Math.sqrt(sumSideSq / count) : 0;
+
+  const midRmsDb = rmsMid > 1e-7 ? 20 * Math.log10(rmsMid) : -100.0;
+  const sideRmsDb = rmsSide > 1e-7 ? 20 * Math.log10(rmsSide) : -100.0;
+  const sideToMidDiffDb = Number((sideRmsDb - midRmsDb).toFixed(1));
+
+  if (sideToMidDiffDb < -42.0) {
+    return {
+      channels,
+      midRmsDb: Number(midRmsDb.toFixed(1)),
+      sideRmsDb: Number(sideRmsDb.toFixed(1)),
+      sideToMidDiffDb,
+      status: 'dual_mono',
+      needsStereoBoost: true,
+      statusLabel: 'Dual-Mono (Kiri = Kanan) · Reduksi Vokal Aktif',
+      detailLabel: 'Kanal Kiri dan Kanan identik. Frekuensi vokal utama direduksi (-12 dB) tanpa delay agar tetap samar dan aman.',
+    };
+  }
+
+  return {
+    channels,
+    midRmsDb: Number(midRmsDb.toFixed(1)),
+    sideRmsDb: Number(sideRmsDb.toFixed(1)),
+    sideToMidDiffDb,
+    status: 'true_stereo',
+    needsStereoBoost: false,
+    statusLabel: `True Stereo Murni (Side/Mid ${sideToMidDiffDb} dB)`,
+    detailLabel: 'Audio sudah memiliki kanal Stereo. Mode Murni (Default) adalah pilihan terbaik untuk kelolosan maksimal.',
+  };
+}
+
+/**
+ * Resolves whether the Vocal-Suppressed Pre-Conditioner should be active.
+ */
+export function shouldApplyStereoBoost(
+  mode: StereoBoostMode,
+  diagnostics: StereoProfileDiagnostics | null
+): boolean {
+  if (mode === 'force_on') return true;
+  if (mode === 'force_off') return false;
+  return diagnostics ? diagnostics.needsStereoBoost : false;
+}
+
+/**
+ * Zero-delay vocal-band attenuation for Mono / Extra Vocal Reduction:
+ * Never delays R relative to L (which would break L-R center cancellation!).
+ * Instead attenuates the 900Hz-2800Hz vocal formant band while keeping L and R 100% phase-aligned.
+ */
+export function applyTrueStereoPreConditionerToChannels(
+  inL: Float32Array,
+  inR: Float32Array | null,
+  sampleRate: number
+): { outL: Float32Array; outR: Float32Array } {
+  const len = inL.length;
+  const rightSource = inR && inR.length === len ? inR : inL;
+  const outL = new Float32Array(len);
+  const outR = new Float32Array(len);
+
+  // Check if L and R are virtually identical (Mono / Dual-Mono)
+  let diffEnergy = 0;
+  const checkLen = Math.min(len, 16384);
+  for (let i = 0; i < checkLen; i++) {
+    const d = inL[i] - rightSource[i];
+    diffEnergy += d * d;
+  }
+  const isMonoLike = checkLen === 0 || diffEnergy / checkLen < 1e-6;
+
+  // Simple 1st-order vocal formant band-stop approximation (attenuates 900Hz-2800Hz vocal presence)
+  const rcLow = 1.0 / (2.0 * Math.PI * 450.0);
+  const dt = 1.0 / (sampleRate || 44100);
+  const alphaLow = dt / (rcLow + dt);
+  let lpL = 0;
+  let lpR = 0;
+
+  for (let i = 0; i < len; i++) {
+    const xL = inL[i];
+    const xR = rightSource[i];
+    lpL = lpL + alphaLow * (xL - lpL);
+    lpR = lpR + alphaLow * (xR - lpR);
+
+    // High/Mid component above 450Hz (where vocal lives) is attenuated to 0.28x (-11 dB)
+    const midHighL = xL - lpL;
+    const midHighR = xR - lpR;
+
+    const filteredL = lpL + 0.28 * midHighL;
+    const filteredR = lpR + 0.28 * midHighR;
+
+    if (isMonoLike) {
+      // Zero-delay slight level offset on vocal-suppressed signal so c0-c1 leaves only a faint ghostly harmonic guide
+      outL[i] = 0.62 * filteredL;
+      outR[i] = 0.38 * filteredR;
+    } else {
+      // On Stereo tracks, keep 100% symmetric L/R (0ms delay) so L-R still cancels 100% of center vocal, PLUS suppresses stereo vocal!
+      outL[i] = filteredL;
+      outR[i] = filteredR;
+    }
+  }
+
+  return { outL, outR };
+}
+

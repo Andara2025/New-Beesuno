@@ -767,6 +767,7 @@ interface ArmorOptions {
   title?: string;
   format?: ArmorFormatType;
   tempoShift?: number;
+  stereoBoost?: boolean;
 }
 
 export interface AudioMetadataInfo {
@@ -1007,10 +1008,21 @@ class CoSuProcessor {
   /**
    * Mengambil string filter DSP FFmpeg berdasarkan preset
    * Menggunakan formula native core FFmpeg (aresample pre-normalization + asetrate + aformat + atempo)
-   * Menjamin presisi matematis 100% pada file 44.1k, 48k (Suno v3.5/v4), dan 96k tanpa drift tempo / pitch.
+   * Jika stereoBoost = true (untuk input Mono, Dual-Mono, atau Vokal Tengah Tipis),
+   * menyuntikkan Pre-Stereoizer Haas 11ms asimetris sebelum pencabutan fase tengah (c0-c1).
    */
-  getDspFilter(preset: string = 'original', tempoShiftPercent: number = -12): string {
+  getDspFilter(
+    preset: string = 'original',
+    tempoShiftPercent: number = -12,
+    stereoBoost: boolean = false,
+    isMonoInput: boolean = false
+  ): string {
     const p = (preset || 'original').toLowerCase().trim();
+    const stereoPreConditioner = isMonoInput
+      ? 'aformat=channel_layouts=stereo,pan=stereo|c0=0.62*c0|c1=0.38*c1,equalizer=f=1150:t=q:w=1.1:g=-12,equalizer=f=2450:t=q:w=1.1:g=-12,'
+      : stereoBoost
+      ? 'equalizer=f=1150:t=q:w=1.1:g=-11,equalizer=f=2450:t=q:w=1.1:g=-11,'
+      : '';
     const pitchShiftCore =
       'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
     // 16-bit triangular dither + 0.95 limiter matches manual converter output (audio_sukses) while keeping 100% symmetric phase cancellation
@@ -1032,21 +1044,21 @@ class CoSuProcessor {
       const tempoMultiplier = 1 + clampedShift / 100;
       const atempoVal = Math.max(0.5, Math.min(2.0, 1.122462 * tempoMultiplier)).toFixed(6);
       const flexPitchTempoCore = `aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=${atempoVal}`;
-      return `aeval=exprs='val(0)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(1)|val(1)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(0)':c=stereo,highpass=f=150,equalizer=f=1350:t=q:w=1.1:g=2.8,equalizer=f=2600:t=q:w=1.0:g=4.2,${flexPitchTempoCore},volume=1.75,${postConditioner}`;
+      return `${stereoPreConditioner}aeval=exprs='val(0)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(1)|val(1)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(0)':c=stereo,highpass=f=150,equalizer=f=1350:t=q:w=1.1:g=2.8,equalizer=f=2600:t=q:w=1.0:g=4.2,${flexPitchTempoCore},volume=1.75,${postConditioner}`;
     }
 
     if (p === 'pulse_armor' || p === 'pulse' || p === 'rhythmic_chop' || p === 'slow_tempo') {
       // ⚡ Pulse Armor (5.5Hz Tremolo Pulse + Bass +3dB + Notch 1800Hz + Transpose -2st + Tempo +5%)
-      return `pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2,${postConditioner}`;
+      return `${stereoPreConditioner}pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2,${postConditioner}`;
     }
 
     if (p === 'warm_armor' || p === 'staccato' || p === 'staccato_guide' || p === 'slow_ballad' || p === 'ballad') {
       // 🌙 Warm Armor (Smooth 3.0s ~22% Vocal Guide with 50ms ramp + Highpass 250Hz + Transpose -2st)
-      return `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
+      return `${stereoPreConditioner}aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
     }
 
     // 🛡️ Vocal Armor / Original Pure SideHarmoni (Default)
-    return `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
+    return `${stereoPreConditioner}pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
   }
 
   generateDefaultOutputPath(
@@ -1126,6 +1138,8 @@ class CoSuProcessor {
       format?: ArmorFormatType;
       title?: string;
       tempoShift?: number;
+      stereoBoost?: boolean;
+      isMonoInput?: boolean;
     } = {},
     onProgress?: ((info: { stage: string; message: string }) => void) | null
   ) {
@@ -1134,6 +1148,8 @@ class CoSuProcessor {
     const duration = parseFloat(String(options.duration || 60.0));
     const canonicalPreset = normalizeArmorPreset(options.preset || 'original');
     const tempoShift = options.tempoShift !== undefined ? Number(options.tempoShift) : -12;
+    const stereoBoost = Boolean(options.stereoBoost);
+    const isMonoInput = Boolean(options.isMonoInput);
     const format: ArmorFormatType =
       options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
     const outputPath =
@@ -1151,7 +1167,7 @@ class CoSuProcessor {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    const dspFilter = this.getDspFilter(canonicalPreset, tempoShift);
+    const dspFilter = this.getDspFilter(canonicalPreset, tempoShift, stereoBoost, isMonoInput);
     const modeLabel =
       canonicalPreset === 'tempo_armor'
         ? 'Tempo Armor'
@@ -1247,7 +1263,10 @@ class CoSuProcessor {
     inputPath: string,
     startTime: number = 0,
     duration: number = 15.0,
-    preset: string = 'original'
+    preset: string = 'original',
+    tempoShift: number = -12,
+    stereoBoost: boolean = false,
+    isMonoInput: boolean = false
   ): Promise<{ dataUri: string; buffer: Buffer }> {
     const tempDir = path.join(os.tmpdir(), 'resu_cosu_previews');
     if (!fs.existsSync(tempDir)) {
@@ -1273,7 +1292,7 @@ class CoSuProcessor {
 
     const tempOutput = path.join(tempDir, `preview_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp3`);
     const cosuPreset = toCoSuPresetKey(preset);
-    const dspFilter = this.getDspFilter(cosuPreset);
+    const dspFilter = this.getDspFilter(cosuPreset, tempoShift, stereoBoost, isMonoInput);
 
     const args = [
       '-y',
@@ -1366,19 +1385,15 @@ async function runArmorFFmpeg(
   await fs.promises.writeFile(tempInput, inputBuffer);
 
   try {
-    // Validate stereo channels using CoSuProcessor.getMetadata
+    let effectiveStereoBoost = Boolean(options.stereoBoost);
+    let isMonoInput = false;
     try {
       const meta = await cosuProcessor.getMetadata(tempInput);
       if (meta.channels < 2) {
-        throw new Error(
-          'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja. Mohon gunakan berkas audio stereo.'
-        );
+        effectiveStereoBoost = true;
+        isMonoInput = true;
       }
-    } catch (metaErr: any) {
-      if (metaErr?.message?.includes('Mono')) {
-        throw metaErr;
-      }
-    }
+    } catch (_) {}
 
     const exportInfo = await cosuProcessor.exportStealthSeed(tempInput, {
       mode: isFull ? 'full' : 'slice',
@@ -1389,6 +1404,8 @@ async function runArmorFFmpeg(
       format,
       title: options.title,
       tempoShift: options.tempoShift,
+      stereoBoost: effectiveStereoBoost,
+      isMonoInput,
     });
 
     const resultBuffer = await fs.promises.readFile(tempOutput);
@@ -1508,6 +1525,13 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
     );
     const tempoShift = Number.isFinite(rawTempoShift) ? rawTempoShift : -12;
 
+    const rawStereoBoost = (
+      (req.query.stereoBoost as string) ||
+      (req.headers['x-armor-stereo-boost'] as string) ||
+      'false'
+    ).toLowerCase();
+    const stereoBoost = rawStereoBoost === 'true' || rawStereoBoost === '1';
+
     const result = await runArmorFFmpeg(audioBuffer, {
       preset,
       mode,
@@ -1516,6 +1540,7 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
       title,
       format,
       tempoShift,
+      stereoBoost,
     });
 
     const safeAsciiFilename = (result.filename || 'Armor_Audio.mp3').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
@@ -1555,15 +1580,27 @@ const handleArmorPreview = async (req: express.Request, res: express.Response) =
       (req.query.preset as string) || (req.headers['x-armor-preset'] as string) || 'original';
     const startTime = parseFloat((req.query.startTime as string) || '0');
     const duration = Math.min(30, parseFloat((req.query.duration as string) || '15.00'));
+    const tempoShift = parseFloat((req.query.tempoShift as string) || '-12');
+    const rawStereoBoost = ((req.query.stereoBoost as string) || 'false').toLowerCase();
+    let stereoBoost = rawStereoBoost === 'true' || rawStereoBoost === '1';
     const responseType = (req.query.responseType as string) || '';
 
     await fs.promises.writeFile(tempInput, audioBuffer);
+
+    try {
+      const meta = await cosuProcessor.getMetadata(tempInput);
+      if (meta.channels < 2) {
+        stereoBoost = true;
+      }
+    } catch (_) {}
 
     const previewResult = await cosuProcessor.renderPreviewFilter(
       tempInput,
       startTime,
       duration,
-      rawPreset
+      rawPreset,
+      Number.isFinite(tempoShift) ? tempoShift : -12,
+      stereoBoost
     );
 
     if (responseType === 'dataUri' || req.headers.accept?.includes('application/json')) {
