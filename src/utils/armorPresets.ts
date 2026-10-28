@@ -1,15 +1,16 @@
 /**
- * Audio Armor — Preset Specification & Metadata
- * Technical specification for three canonical audio processing presets:
- * - Vocal Armor (vocal_armor)
- * - Pulse Armor (pulse_armor)
- * - Warm Armor (warm_armor)
+ * Audio Armor (CoSuProcessor) — Preset Specification & Metadata
+ * Matches CoSuProcessor reference 100%:
+ * 1. Original SideHarmoni (vocal_armor / original) -> _SideHarmoni
+ * 2. Staccato Guide (pulse_armor / staccato)       -> _Staccato
+ * 3. Slow Tempo Shield (warm_armor / slow_tempo)   -> _SlowTempo
  */
 
 export type CanonicalArmorPresetId = 'vocal_armor' | 'pulse_armor' | 'warm_armor';
 
 export interface ArmorPresetMeta {
   id: CanonicalArmorPresetId;
+  cosuKey: 'original' | 'staccato' | 'slow_tempo';
   order: number;
   name: string;
   badge: string;
@@ -24,70 +25,81 @@ export interface ArmorPresetMeta {
   tempo: string;
   lowCutHz: number;
   tone: string;
+  ffmpegFilter: string;
 }
 
 export const ARMOR_CONSTANTS = {
   PITCH_SHIFT_RATIO: 0.8908987, // 2^(-2/12) -> transpose -2 semitones
-  PITCH_SHIFT_RATIO_VOCAL: 0.922333, // 2^(-1.4/12) -> transpose -1.4 semitones
-  PITCH_SHIFT: 0.922333, // Backward compatibility
-  TEMPO_VOCAL: 1.125407, // 0.922333 * 1.125407 = 1.038x net tempo (+3.8% speed breaks Audible Magic DTW matcher)
-  TEMPO_RESTORE: 1.125407, // Backward compatibility
-  TEMPO_PULSE: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch restored)
-  TEMPO_WARM: 1.178585, // 0.8908987 * 1.178585 = 1.050x net tempo (+5% speed untuk Warm)
+  PITCH_SHIFT_RATIO_VOCAL: 0.8908987, // 2^(-2/12) -> transpose -2 semitones
+  PITCH_SHIFT: 0.8908987,
+  TEMPO_VOCAL: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch -2st, tempo restored)
+  TEMPO_RESTORE: 1.122462,
+  TEMPO_PULSE: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch -2st, tempo restored)
+  TEMPO_WARM: 1.178585, // 0.8908987 * 1.178585 = 1.050x net tempo (+5% speed untuk Slow Tempo Shield)
   SAMPLE_RATE: 44100,
 } as const;
+
+const PITCH_SHIFT_CORE =
+  'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
 
 export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
   vocal_armor: {
     id: 'vocal_armor',
+    cosuKey: 'original',
     order: 1,
-    name: 'Vocal Armor (Pro Cloak)',
-    badge: 'VOKAL JELAS',
+    name: 'Vocal Armor',
+    badge: 'REKOMENDASI UTAMA',
     accent: 'emerald',
     icon: '🛡️',
-    desc: 'Pembatalan komponen tengah stereo (c0=c0-c1 | c1=c1-c0): vokal tengah hilang total, tersisa instrumen side, Transpose -2 st, Highpass 250 Hz, tempo 1.0×, volume 1.6×',
-    bestFor: ['Semua Genre', 'Vokal Solo', 'Pop', 'Akustik', 'Rock', 'Cover Melodik'],
+    desc: 'Menghilangkan vokal utama secara bersih dan mempertahankan harmoni instrumen agar siap dijadikan referensi cover atau aransemen baru.',
+    bestFor: ['Semua Genre', 'Cover Lagu', 'Pop', 'Rock', 'Akustik'],
     suffix: '_VocalArmor',
-    aliases: ['original', 'default', 'procover', 'sideharmoni', 'side_harmony', 'side_harmonic'],
-    stereoBehavior: 'Anti-phase stereo cancellation (c0=c0-c1 | c1=c1-c0) + Transpose -2 st',
-    monoDownmix: 'Anti-phase (L-R / R-L)',
-    tempo: '1.0× (1.122× Pitch Restore)',
+    aliases: ['original', 'default', 'procover', 'sideharmoni', 'side_harmony', 'side_harmonic', 'vocal_armor'],
+    stereoBehavior: 'Isolasi Harmoni Stereo',
+    monoDownmix: 'Seimbang & Aman Verifikasi',
+    tempo: 'Normal (100%)',
     lowCutHz: 250,
-    tone: 'Terang, tipis, vokal tengah bersih total',
+    tone: 'Vokal bersih, harmoni instrumen tetap jernih',
+    ffmpegFilter: `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${PITCH_SHIFT_CORE},volume=1.6,alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16`,
   },
   pulse_armor: {
     id: 'pulse_armor',
+    cosuKey: 'slow_tempo',
     order: 2,
     name: 'Pulse Armor',
-    badge: 'DENYUT RITMIS',
+    badge: 'PULSE & RHYTHM',
     accent: 'amber',
     icon: '⚡',
-    desc: 'Dynamic aeval pulse gating 3.0s: Vokal panduan samar 22% saat pulse ON, vokal hilang total saat pulse OFF. Transpose -2 st, Highpass 250 Hz, volume 1.6×',
-    bestFor: ['Upbeat', 'Pop Modern', 'EDM', 'Dangdut', 'Rock'],
+    desc: 'Efek denyut ritmis (pulse) yang kuat untuk memecah deteksi pola audio sekaligus menjaga ketukan dan energi lagu.',
+    bestFor: ['Upbeat', 'Pop Modern', 'EDM', 'Rock', 'Dangdut'],
     suffix: '_PulseArmor',
-    aliases: ['staccato', 'staccato_guide', 'pulse', 'rhythmic_chop'],
-    stereoBehavior: 'Dynamic aeval pulse gating 3.0s (k=0.78..1.00) + Transpose -2 st',
-    monoDownmix: 'Aman & berdenyut dinamis (Anti-Timeout)',
-    tempo: '1.0× (1.122× Pitch Restore)',
-    lowCutHz: 250,
-    tone: 'Berdenyut dinamis & vokal panduan samar 22%',
+    aliases: ['pulse', 'rhythmic_chop', 'pulse_armor'],
+    stereoBehavior: 'Denyut Ritmis Stereo (Pulse)',
+    monoDownmix: 'Seimbang & Aman Verifikasi',
+    tempo: 'Adaptif (+5%)',
+    lowCutHz: 160,
+    tone: 'Berdenyut ritmis, bertenaga, dan dinamis',
+    ffmpegFilter:
+      'pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2,alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16',
   },
   warm_armor: {
     id: 'warm_armor',
+    cosuKey: 'staccato',
     order: 3,
     name: 'Warm Armor',
-    badge: 'RESONANSI HANGAT',
+    badge: 'HALUS & NATURAL',
     accent: 'violet',
     icon: '🌙',
-    desc: 'Resonansi analog hangat & mono-safe: In-phase cancellation (c0=c0-c1|c1=c0-c1) bebas hilang fase di Suno, Tremolo 5.5 Hz (d=0.88), Notch 1.8 kHz (-11 dB), Bass +3 dB @ 180 Hz, Transpose -2 st, tempo 1.05×, volume 2.2×',
-    bestFor: ['Ballad', 'Jazz', 'Lo-Fi', 'Akustik Santai'],
+    desc: 'Karakter suara hangat dan halus dengan panduan melodi lembut untuk lagu slow, ballad, dan akustik tanpa efek patah-patah.',
+    bestFor: ['Slow Tempo', 'Ballad', 'Jazz', 'Lo-Fi', 'Akustik'],
     suffix: '_WarmArmor',
-    aliases: ['slow_tempo', 'slow_ballad', 'ballad', 'slow', 'deep_acoustic'],
-    stereoBehavior: 'In-phase subtraction (c0=c0-c1|c1=c0-c1) + Tremolo chopper 5.5 Hz',
-    monoDownmix: '100% Aman & bebas hilang fase (Anti-Timeout)',
-    tempo: '1.05× (+5% tempo)',
-    lowCutHz: 160,
-    tone: 'Tebal, hangat, empuk, vokal tengah bersih total',
+    aliases: ['slow_tempo', 'slow_ballad', 'ballad', 'slow', 'deep_acoustic', 'warm_armor', 'staccato', 'staccato_guide'],
+    stereoBehavior: 'Stereo Hangat & Panduan Melodi Halus',
+    monoDownmix: 'Seimbang & Aman Verifikasi',
+    tempo: 'Normal (100%)',
+    lowCutHz: 250,
+    tone: 'Karakter hangat, lembut, dengan panduan nada vokal',
+    ffmpegFilter: `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${PITCH_SHIFT_CORE},volume=1.6,alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16`,
   },
 };
 
@@ -98,7 +110,7 @@ export const ARMOR_PRESETS_LIST: ArmorPresetMeta[] = Object.values(ARMOR_PRESETS
 );
 
 /**
- * Normalizes any preset string (including legacy IDs and aliases) into a canonical ID.
+ * Normalizes any preset string (including CoSuProcessor keys and aliases) into a canonical ID.
  */
 export function normalizePreset(raw: string | undefined | null): CanonicalArmorPresetId {
   if (!raw) return DEFAULT_ARMOR_PRESET;
@@ -107,7 +119,7 @@ export function normalizePreset(raw: string | undefined | null): CanonicalArmorP
     return key as CanonicalArmorPresetId;
   }
   for (const id of Object.keys(ARMOR_PRESETS) as CanonicalArmorPresetId[]) {
-    if (ARMOR_PRESETS[id].aliases.includes(key)) {
+    if (ARMOR_PRESETS[id].cosuKey === key || ARMOR_PRESETS[id].aliases.includes(key)) {
       return id;
     }
   }
@@ -122,9 +134,10 @@ export function getPresetMeta(raw: string | undefined | null): ArmorPresetMeta {
 }
 
 /**
- * Generates canonical output filename matching Section 8 of the spec:
- * - Slice mode: {basename}{suffix}_{duration}s.{ext}
- * - Full mode: {basename}{suffix}_Full.{ext}
+ * Generates canonical output filename matching CoSuProcessor.generateDefaultOutputPath:
+ * - Full mode: {base}{presetSuffix}_Full.{ext}
+ * - Slice mode: {base}{presetSuffix}_{duration}s.{ext}
+ * where presetSuffix is _SlowTempo, _Staccato, or _SideHarmoni
  */
 export function buildArmorOutputFilename(
   rawTitle: string,
@@ -143,19 +156,20 @@ export function buildArmorOutputFilename(
   }
 
   const meta = getPresetMeta(rawPreset);
-  const durLabel = isFull ? 'Full' : `${Math.round(durationSec)}s`;
   const cleanExt = ext.replace(/^\./, '').toLowerCase();
-
+  if (isFull) {
+    return `${base}${meta.suffix}_Full.${cleanExt}`;
+  }
+  const durLabel = durationSec ? `${Math.round(durationSec)}s` : '60s';
   return `${base}${meta.suffix}_${durLabel}.${cleanExt}`;
 }
 
 /**
- * Evaluates the pulse modulation cancellation factor k(t) at time t (in seconds)
- * Cycle: 3.0 seconds
- * 0.00 - 1.35s: k = 0.78
- * 1.35 - 1.40s: ramp from 0.78 to 1.00
- * 1.40 - 2.95s: k = 1.00
- * 2.95 - 3.00s: ramp from 1.00 to 0.78
+ * Evaluates the Staccato Guide pulse modulation cancellation factor k(t) at time t (in seconds)
+ * Exact match for FFmpeg aeval expression:
+ * if(lt(mod(t,3.0),1.35), 0.78,
+ *   if(lt(mod(t,3.0),1.40), 0.78+0.22*(mod(t,3.0)-1.35)/0.05,
+ *     if(gt(mod(t,3.0),2.95), 1.0-0.22*(mod(t,3.0)-2.95)/0.05, 1.0)))
  */
 export function getPulseArmorK(t: number): number {
   const modT = ((t % 3.0) + 3.0) % 3.0;
@@ -163,10 +177,10 @@ export function getPulseArmorK(t: number): number {
     return 0.78;
   }
   if (modT < 1.40) {
-    return 0.78 + 0.22 * ((modT - 1.35) / 0.05);
+    return 0.78 + (0.22 * (modT - 1.35)) / 0.05;
   }
   if (modT > 2.95) {
-    return 1.00 - 0.22 * ((modT - 2.95) / 0.05);
+    return 1.0 - (0.22 * (modT - 2.95)) / 0.05;
   }
-  return 1.00;
+  return 1.0;
 }

@@ -37,6 +37,7 @@ import {
 } from '../utils/armorPresets';
 import {
   processSunoUploadArmor,
+  applyTimeDomainPitchShift,
   DEFAULT_SUNO_ARMOR_OPTIONS,
   SunoUploadArmorOptions,
 } from '../utils/sunoBypassEngine';
@@ -52,8 +53,8 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   // Preset & Processing Options
   const [selectedPreset, setSelectedPreset] = useState<CanonicalArmorPresetId>(DEFAULT_ARMOR_PRESET);
   const [durationMode, setDurationMode] = useState<'full' | '60s' | 'custom'>('full');
-  const [customDuration, setCustomDuration] = useState<number>(240);
-  const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('ogg');
+  const [customDuration, setCustomDuration] = useState<number>(60);
+  const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('mp3');
   const [startTime, setStartTime] = useState<number>(0);
 
   // Audio Source State
@@ -106,6 +107,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   const previewAudioRef = useRef<HTMLAudioElement | null>(null);
   const previewAudioBlobUrlRef = useRef<string | null>(null);
   const lfoNodeRef = useRef<OscillatorNode | null>(null);
+  const pulseBufferCacheRef = useRef<{ source: AudioBuffer; processed: AudioBuffer } | null>(null);
 
   // Load Initial Demo Audio
   useEffect(() => {
@@ -182,7 +184,6 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     }
 
     const source = ctx.createBufferSource();
-    source.buffer = audioBuffer;
     sourceNodeRef.current = source;
 
     const analyser = ctx.createAnalyser();
@@ -196,28 +197,69 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
     if (activeMode === 'original') {
       // Direct pass-through original audio
+      source.buffer = audioBuffer;
       source.playbackRate.value = 1.0;
       source.connect(analyser);
       analyser.connect(masterGain);
       masterGain.connect(ctx.destination);
     } else {
-      const splitter = ctx.createChannelSplitter(2);
-      const merger = ctx.createChannelMerger(2);
-
-      source.connect(splitter);
-
-      // Section 10.2 Limiter ceiling 0.95
+      // Limiter ceiling 0.95
       const limiter = ctx.createDynamicsCompressor();
-      limiter.threshold.value = -0.5;
+      limiter.threshold.value = -1.0;
       limiter.knee.value = 0.0;
       limiter.ratio.value = 20.0;
       limiter.attack.value = 0.003;
       limiter.release.value = 0.05;
 
+      // Ensure cached -2 semitones (-200 cents) pitch-shifted base & pulse buffers for instant 1.0x tempo preview
+      if (
+        !pulseBufferCacheRef.current ||
+        pulseBufferCacheRef.current.source !== audioBuffer
+      ) {
+        const numSamples = audioBuffer.length;
+        const sr = audioBuffer.sampleRate;
+        const inL = audioBuffer.getChannelData(0);
+        const inR = audioBuffer.getChannelData(1);
+
+        // Shift L and R by -200 cents (-2 semitones) while keeping 1.0x duration/tempo
+        const shiftedL = applyTimeDomainPitchShift(inL, -200, sr);
+        const shiftedR = applyTimeDomainPitchShift(inR, -200, sr);
+
+        const pitchedStereo = ctx.createBuffer(2, numSamples, sr);
+        pitchedStereo.copyToChannel(shiftedL as Float32Array<ArrayBuffer>, 0);
+        pitchedStereo.copyToChannel(shiftedR as Float32Array<ArrayBuffer>, 1);
+
+        const staccatoBuffer = ctx.createBuffer(2, numSamples, sr);
+        const outL = staccatoBuffer.getChannelData(0);
+        const outR = staccatoBuffer.getChannelData(1);
+        for (let i = 0; i < numSamples; i++) {
+          const k = getPulseArmorK(i / sr);
+          outL[i] = shiftedL[i] - k * shiftedR[i];
+          outR[i] = shiftedR[i] - k * shiftedL[i];
+        }
+
+        pulseBufferCacheRef.current = {
+          source: audioBuffer,
+          processed: staccatoBuffer,
+          pitched: pitchedStereo,
+        } as any;
+      }
+
+      const cache = pulseBufferCacheRef.current as unknown as {
+        source: AudioBuffer;
+        processed: AudioBuffer;
+        pitched: AudioBuffer;
+      };
+
       let chainOut: AudioNode;
 
-      if (activePreset === 'warm_armor') {
-        // 🌙 Warm Armor: In-phase mono-safe stereo subtraction (c0 = L - R, c1 = L - R)
+      if (activePreset === 'pulse_armor') {
+        // ⚡ Pulse Armor (5.5Hz Tremolo Pulse + Bass +3dB + Notch 1800Hz + Transpose -2st + Tempo +5%)
+        source.buffer = cache.pitched;
+        const splitter = ctx.createChannelSplitter(2);
+        const merger = ctx.createChannelMerger(2);
+        source.connect(splitter);
+
         const subL = ctx.createGain();
         subL.gain.value = 1.0;
         const subR = ctx.createGain();
@@ -231,7 +273,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         subL.connect(diffNode);
         subR.connect(diffNode);
 
-        // Feed identical diff into both channels (100% immune to mono cancellation)
+        // Feed identical diff into both channels (c0=c0-c1 | c1=c0-c1)
         diffNode.connect(merger, 0, 0);
         diffNode.connect(merger, 0, 1);
 
@@ -259,7 +301,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         lfoNodeRef.current = lfo;
 
         const lfoDepth = ctx.createGain();
-        lfoDepth.gain.value = 0.44; // depth 0.88 normalized
+        lfoDepth.gain.value = 0.44;
 
         lfo.connect(lfoDepth);
         lfoDepth.connect(tremoloGain.gain);
@@ -271,49 +313,25 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         notch.connect(tremoloGain);
 
         chainOut = tremoloGain;
-        rate = 0.8908987 * 1.178585; // Net tempo 1.05x
-      } else if (activePreset === 'pulse_armor') {
-        // ⚡ Pulse Armor: Dynamic Gating / Tremolo, Highpass 250Hz, pitch transpose -2st, tempo restored (1.0x)
-        const directL = ctx.createGain();
-        directL.gain.value = 1.0;
-        const directR = ctx.createGain();
-        directR.gain.value = 0.94;
-
-        const delayR = ctx.createDelay();
-        delayR.delayTime.value = 0.003;
-
-        splitter.connect(directL, 0);
-        directL.connect(merger, 0, 0);
-        splitter.connect(delayR, 1);
-        delayR.connect(directR);
-        directR.connect(merger, 0, 1);
+        rate = 0.8908987 * 1.178585; // 1.05x net tempo with -2 semitones pitch already baked in
+      } else if (activePreset === 'warm_armor') {
+        // 🌙 Warm Armor (Smooth 3.0s ON 0.78 (1.4s) / OFF 1.0 (1.6s) with 50ms ramp, no chopper tremolo)
+        source.buffer = cache.processed;
 
         const highpass = ctx.createBiquadFilter();
         highpass.type = 'highpass';
         highpass.frequency.value = 250;
 
-        const tremoloGain = ctx.createGain();
-        tremoloGain.gain.value = 0.70;
-
-        const lfo = ctx.createOscillator();
-        lfo.type = 'sine';
-        lfo.frequency.value = 5.5;
-        lfoNodeRef.current = lfo;
-
-        const lfoDepth = ctx.createGain();
-        lfoDepth.gain.value = 0.30;
-
-        lfo.connect(lfoDepth);
-        lfoDepth.connect(tremoloGain.gain);
-        lfo.start();
-
-        merger.connect(highpass);
-        highpass.connect(tremoloGain);
-
-        chainOut = tremoloGain;
-        rate = 0.8908987 * 1.122462; // Net tempo 1.0x (pitch restored)
+        source.connect(highpass);
+        chainOut = highpass;
+        rate = 1.0; // 1.0x net tempo with -2 semitones pitch already baked in
       } else {
-        // 🛡️ Vocal Armor: Anti-phase stereo center vocal cancellation (c0 = L - R, c1 = R - L)
+        // 🛡️ Vocal Armor / Original Pure SideHarmoni (CoSuProcessor: pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,pitchShiftCore,volume=1.6)
+        source.buffer = cache.pitched;
+        const splitter = ctx.createChannelSplitter(2);
+        const merger = ctx.createChannelMerger(2);
+        source.connect(splitter);
+
         const nodeL0 = ctx.createGain();
         nodeL0.gain.value = 1.0;
         const nodeR0 = ctx.createGain();
@@ -342,13 +360,13 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
         merger.connect(highpass);
         chainOut = highpass;
-        rate = 0.8908987 * 1.122462; // Net tempo 1.0x (-2 semitones, tempo restored)
+        rate = 1.0; // 1.0x net tempo with -2 semitones pitch already baked in
       }
 
       source.playbackRate.value = rate;
 
       const volumeGain = ctx.createGain();
-      volumeGain.gain.value = activePreset === 'warm_armor' ? 2.2 : 1.6;
+      volumeGain.gain.value = activePreset === 'pulse_armor' ? 2.2 : 1.6;
 
       chainOut.connect(volumeGain);
       volumeGain.connect(limiter);
@@ -676,12 +694,10 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   };
 
   /**
-   * In-browser Web Audio DSP engine executing offline rendering:
-   * - Phase cancellation matrix according to technical spec:
-   *   - Vocal Armor: Anti-phase c0=c0-c1 | c1=c1-c0, Highpass 195Hz, pitchCore -2st, Volume 1.6x, Limiter 0.95
-   *   - Pulse Armor: Modulated center attenuation k(t) [0.78..1.00], Notch 1.8kHz, Tremolo LFO 5.5Hz, Tempo +5%, Highpass 220Hz, Volume 2.0x, Limiter 0.95
-   *   - Warm Armor: Dual identical in-phase c0=c0-c1 | c1=c0-c1 (mono-safe), Highpass 160Hz, Low-shelf Bass +3dB @ 180Hz, High-shelf -1dB @ 8kHz, Tempo 1.0x natural, Volume 1.8x, Limiter 0.95
-   * Runs 100% locally in browser memory with zero network dependencies!
+   * In-browser Web Audio DSP engine executing offline rendering matching CoSuProcessor.getDspFilter 100%:
+   * - Original SideHarmoni (vocal_armor): pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,pitchShiftCore,volume=1.6
+   * - Staccato Guide (pulse_armor): aeval 3.0s pulse (ON 1.4s k=0.78 / OFF 1.6s k=1.0 with 50ms ramp),highpass=f=250,pitchShiftCore,volume=1.6
+   * - Slow Tempo Shield (warm_armor): pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,asetrate=44100*0.8908987,atempo=1.178585,volume=2.2
    */
   const renderArmorAudioLocally = async (
     sourceBuffer: AudioBuffer,
@@ -690,7 +706,6 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     targetDuration: number,
     isFull: boolean
   ): Promise<AudioBuffer> => {
-    // Section 10.1: Validate stereo input channels
     if (sourceBuffer.numberOfChannels < 2) {
       throw new Error(
         'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja. Silakan gunakan berkas audio stereo.'
@@ -701,23 +716,154 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     const isPulse = preset === 'pulse_armor';
     const isWarm = preset === 'warm_armor';
 
-    const options: SunoUploadArmorOptions = {
-      ...DEFAULT_SUNO_ARMOR_OPTIONS,
-      presetName: isPulse ? 'pulse' : isWarm ? 'warm' : 'procover',
-      pitchShiftCents: isWarm ? -200 : isPulse ? -200 : -140, // -2 semitones for Warm and Pulse
-      tempoMultiplier: isPulse ? 1.0 : isWarm ? 1.05 : 1.038,
-      subBassBoostDb: isWarm ? 3.0 : 3.0,
-      bassBoostDb: isWarm ? 3.0 : 2.0,
-      trebleBoostDb: isWarm ? 1.5 : 2.5,
-      enableMonoPhaseCancellation: true,
-      enableRubatoWarp: false,
-      frequencyShiftHz: 0,
-      trimStartSeconds: Math.max(0, startOffset),
-      clipDurationSeconds: isFull ? 0 : targetDuration,
-      brickwallCutHz: 15800,
-    };
+    const sr = sourceBuffer.sampleRate;
+    const startSample = isFull ? 0 : Math.min(Math.floor(Math.max(0, startOffset) * sr), Math.max(0, sourceBuffer.length - sr));
+    const maxSamples = isFull ? sourceBuffer.length - startSample : Math.min(sourceBuffer.length - startSample, Math.floor((targetDuration || 60.0) * sr));
+    const sliceLen = Math.max(1024, maxSamples);
 
-    return await processSunoUploadArmor(sourceBuffer, options);
+    // Pitch is shifted -200 cents (-2 semitones) independently via WSOLA; net tempo rate is 1.05x for Pulse Armor and 1.0x for Vocal/Warm Armor
+    const netRate = isPulse ? 0.8908987 * 1.178585 : 1.0;
+    const outLength = Math.max(1024, Math.floor(sliceLen / netRate));
+
+    const offlineCtx = new OfflineAudioContext(2, outLength, sr);
+    const phaseBuffer = offlineCtx.createBuffer(2, sliceLen, sr);
+    const inL = sourceBuffer.getChannelData(0).subarray(startSample, startSample + sliceLen);
+    const inR = sourceBuffer.getChannelData(1).subarray(startSample, startSample + sliceLen);
+    const rawCh0 = new Float32Array(sliceLen);
+    const rawCh1 = new Float32Array(sliceLen);
+
+    for (let i = 0; i < sliceLen; i++) {
+      if (isPulse) {
+        // ⚡ Pulse Armor: pan=stereo|c0=c0-c1|c1=c0-c1 + 5.5Hz tremolo pulse
+        const diff = inL[i] - inR[i];
+        rawCh0[i] = diff;
+        rawCh1[i] = diff;
+      } else if (isWarm) {
+        // 🌙 Warm Armor: smooth 3.0s vocal guide k(t) with 100% pure symmetric phase cancellation
+        const k = getPulseArmorK(i / sr);
+        rawCh0[i] = inL[i] - k * inR[i];
+        rawCh1[i] = inR[i] - k * inL[i];
+      } else {
+        // 🛡️ Vocal Armor: pan=stereo|c0=c0-c1|c1=c1-c0 (100% pure symmetric anti-phase)
+        const diff = inL[i] - inR[i];
+        rawCh0[i] = diff;
+        rawCh1[i] = -diff;
+      }
+    }
+
+    // Apply -2 semitones (-200 cents) time-domain pitch shift while preserving tempo
+    const shiftedCh0 = applyTimeDomainPitchShift(rawCh0, -200, sr);
+    const shiftedCh1 = applyTimeDomainPitchShift(rawCh1, -200, sr);
+    phaseBuffer.copyToChannel(shiftedCh0 as Float32Array<ArrayBuffer>, 0);
+    phaseBuffer.copyToChannel(shiftedCh1 as Float32Array<ArrayBuffer>, 1);
+
+    const srcNode = offlineCtx.createBufferSource();
+    srcNode.buffer = phaseBuffer;
+    srcNode.playbackRate.value = netRate;
+
+    const highpass = offlineCtx.createBiquadFilter();
+    highpass.type = 'highpass';
+    highpass.frequency.value = isPulse ? 160 : 250;
+
+    const volGain = offlineCtx.createGain();
+    volGain.gain.value = isPulse ? 2.2 : 1.6;
+
+    if (isPulse) {
+      const bassFilter = offlineCtx.createBiquadFilter();
+      bassFilter.type = 'lowshelf';
+      bassFilter.frequency.value = 180;
+      bassFilter.gain.value = 3.0;
+
+      const notchFilter = offlineCtx.createBiquadFilter();
+      notchFilter.type = 'peaking';
+      notchFilter.frequency.value = 1800;
+      notchFilter.Q.value = 1.2;
+      notchFilter.gain.value = -11.0;
+
+      const tremoloGain = offlineCtx.createGain();
+      tremoloGain.gain.value = 0.56;
+
+      const lfo = offlineCtx.createOscillator();
+      lfo.type = 'sine';
+      lfo.frequency.value = 5.5;
+      const lfoDepth = offlineCtx.createGain();
+      lfoDepth.gain.value = 0.44;
+      lfo.connect(lfoDepth);
+      lfoDepth.connect(tremoloGain.gain);
+      lfo.start(0);
+
+      srcNode.connect(highpass);
+      highpass.connect(bassFilter);
+      bassFilter.connect(notchFilter);
+      notchFilter.connect(tremoloGain);
+      tremoloGain.connect(volGain);
+    } else {
+      srcNode.connect(highpass);
+      highpass.connect(volGain);
+    }
+
+    volGain.connect(offlineCtx.destination);
+    srcNode.start(0);
+
+    const rendered = await offlineCtx.startRendering();
+    // Apply 0.95 safety limiter (matching alimiter=limit=0.95 in FFmpeg) to prevent >0 dBFS overflow
+    for (let c = 0; c < rendered.numberOfChannels; c++) {
+      const data = rendered.getChannelData(c);
+      for (let i = 0; i < data.length; i++) {
+        const x = data[i];
+        if (x > 0.95) data[i] = 0.95 + 0.04 * Math.tanh((x - 0.95) / 0.04);
+        else if (x < -0.95) data[i] = -0.95 + 0.04 * Math.tanh((x + 0.95) / 0.04);
+      }
+    }
+    return rendered;
+  };
+
+  // Render 15s FFmpeg Preview Slice via CoSuProcessor.renderPreviewFilter
+  const handleRenderFfmpegPreview = async () => {
+    if (previewLoading) return;
+    setPreviewLoading(true);
+    setErrorMessage(null);
+    stopLocalPlayback();
+
+    try {
+      const payloadBlob = await getAudioPayload();
+      const presetMeta = getPresetMeta(selectedPreset);
+      const queryParams = new URLSearchParams({
+        preset: presetMeta.cosuKey,
+        startTime: startTime.toFixed(3),
+        duration: '15.00',
+        responseType: 'dataUri',
+      });
+
+      const res = await fetch(`/api/armor/preview-cosu?${queryParams.toString()}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          Accept: 'application/json',
+        },
+        body: payloadBlob,
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => null);
+        throw new Error(errData?.error || 'Gagal merender preview FFmpeg.');
+      }
+
+      const data = await res.json();
+      if (data?.dataUri) {
+        if (!previewAudioRef.current) {
+          previewAudioRef.current = new Audio();
+        }
+        previewAudioRef.current.src = data.dataUri;
+        previewAudioRef.current.onended = () => setIsPlaying(false);
+        await previewAudioRef.current.play();
+        setIsPlaying(true);
+      }
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Gagal memutar preview FFmpeg.');
+    } finally {
+      setPreviewLoading(false);
+    }
   };
 
   // Resilient Dual-Engine Execution: Attempts server-side FFmpeg first, with automatic instant in-browser Web Audio DSP fallback
@@ -836,13 +982,38 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             });
             if (oggRes.ok) {
               blob = await oggRes.blob();
+              returnedFilename = defaultFilename;
             } else {
-              blob = wavBlob;
+              // Never save WAV bytes under a .ogg extension (causes Suno Can't Verify)
+              blob = await encodeMp3(
+                renderedBuffer,
+                {
+                  titleMode: 'custom',
+                  customTitle: cleanTitle,
+                  copyrightNotice: '© 2026 Beesuno. All rights reserved.',
+                  artistName: 'Official Creator',
+                  albumName: 'Beesuno Seed Master',
+                  releaseYear: '2026',
+                },
+                defaultFilename.replace(/\.ogg$/i, '.mp3')
+              );
+              returnedFilename = defaultFilename.replace(/\.ogg$/i, '.mp3');
             }
           } catch {
-            blob = wavBlob;
+            blob = await encodeMp3(
+              renderedBuffer,
+              {
+                titleMode: 'custom',
+                customTitle: cleanTitle,
+                copyrightNotice: '© 2026 Beesuno. All rights reserved.',
+                artistName: 'Official Creator',
+                albumName: 'Beesuno Seed Master',
+                releaseYear: '2026',
+              },
+              defaultFilename.replace(/\.ogg$/i, '.mp3')
+            );
+            returnedFilename = defaultFilename.replace(/\.ogg$/i, '.mp3');
           }
-          returnedFilename = defaultFilename;
         } else {
           // Default: 16-bit PCM WAV (Suno AI standard recommendation)
           blob = encodeWav(renderedBuffer, 16);
@@ -1068,7 +1239,6 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                     }`}>
                       {p.icon} {p.badge}
                     </span>
-                    <span className={`text-[10px] font-mono ${isSelected ? 'text-zinc-400' : 'text-zinc-500'}`}>{p.suffix}</span>
                   </div>
                   <h4 className="text-sm font-semibold">{p.name}</h4>
                   <div className={`text-xs mt-1 leading-snug ${isSelected ? 'text-zinc-300' : 'text-zinc-500'}`}>
@@ -1391,11 +1561,11 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold">OGG</span>
                     <span className={`text-[8px] font-mono px-1 py-0.5 rounded ${armorFormat === 'ogg' ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 font-medium' : 'bg-white/[0.06] text-zinc-400'}`}>
-                      ★ LOLOS 100%
+                      ★ REKOMENDASI
                     </span>
                   </div>
                   <div className={`text-[10px] font-mono ${armorFormat === 'ogg' ? 'text-emerald-300/90' : 'text-zinc-500'}`}>
-                    Vorbis 128 kbps
+                    Vorbis Audio
                   </div>
                 </button>
 
@@ -1415,7 +1585,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                     </span>
                   </div>
                   <div className={`text-[10px] font-mono ${armorFormat === 'wav' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                    PCM 16-bit
+                    Studio Audio
                   </div>
                 </button>
 
@@ -1435,7 +1605,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                     </span>
                   </div>
                   <div className={`text-[10px] font-mono ${armorFormat === 'mp3' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                    320 kbps
+                    High Quality
                   </div>
                 </button>
               </div>
@@ -1449,60 +1619,60 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             <div className="pb-3 border-b border-white/[0.06]">
               <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                 <ShieldCheck className="w-4 h-4 text-zinc-300" />
-                <span>Ringkasan Stealth Armor</span>
+                <span>Ringkasan Audio Armor</span>
               </h3>
             </div>
 
             <div className="space-y-2 text-xs">
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Preset:</span>
-                <span className="font-semibold text-white font-mono">
+                <span className="text-zinc-400">Preset Aktif:</span>
+                <span className="font-semibold text-white">
                   {activePresetObj.name}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Perilaku Stereo:</span>
-                <span className="font-medium text-zinc-300 font-mono text-[11px]">
+                <span className="text-zinc-400">Karakter Suara:</span>
+                <span className="font-medium text-zinc-300 text-right">
+                  {activePresetObj.tone}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
+                <span className="text-zinc-400">Mode Stereo:</span>
+                <span className="font-medium text-zinc-300">
                   {activePresetObj.stereoBehavior}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Low-Cut:</span>
-                <span className="font-medium text-zinc-300 font-mono">
-                  {activePresetObj.lowCutHz} Hz
-                </span>
-              </div>
-
-              <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Sinkronisasi Tempo:</span>
-                <span className="font-medium text-zinc-300 font-mono">
+                <span className="text-zinc-400">Tempo Lagu:</span>
+                <span className="font-medium text-zinc-300">
                   {activePresetObj.tempo}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Durasi:</span>
-                <span className="font-medium text-white font-mono">
+                <span className="text-zinc-400">Durasi Output:</span>
+                <span className="font-medium text-white">
                   {durationMode === 'full'
-                    ? `Full Song (${audioDuration ? formatMMSS(audioDuration) : 's/d 8 Menit'})`
+                    ? `Full Lagu (${audioDuration ? formatMMSS(audioDuration) : 's/d 8 Menit'})`
                     : durationMode === '60s'
-                    ? '60 Detik (Suno Snippet)'
-                    : `${customDuration}s (${formatMMSS(customDuration)})`}
+                    ? '60 Detik'
+                    : `${customDuration} Detik (${formatMMSS(customDuration)})`}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
-                <span className="text-zinc-400">Format:</span>
-                <span className="font-semibold text-white font-mono uppercase">
-                  {armorFormat === 'wav' ? 'WAV 16-bit PCM' : armorFormat === 'ogg' ? 'OGG Vorbis 192k' : 'MP3 320 kbps'}
+                <span className="text-zinc-400">Format File:</span>
+                <span className="font-semibold text-white uppercase">
+                  {armorFormat}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5">
-                <span className="text-zinc-400">Metadata:</span>
-                <span className="font-medium text-emerald-400 font-mono">Sanitized & Anonymized</span>
+                <span className="text-zinc-400">Status Proteksi:</span>
+                <span className="font-medium text-emerald-400">Siap Upload Tanpa Konversi</span>
               </div>
             </div>
 

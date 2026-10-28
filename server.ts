@@ -6,10 +6,10 @@ import fs from 'fs';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
-dotenv.config();
+dotenv.config({ quiet: true });
 
 const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const __dirname = import.meta.dirname || path.dirname(__filename);
 
 const app = express();
 // AI Studio dev server must run on port 3000 (port 8080 is reserved by nginx proxy)
@@ -33,15 +33,21 @@ app.use((req, res, next) => {
 
 app.use(express.json({ limit: '10mb' }));
 
-// Initialize GoogleGenAI server-side with telemetry header
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY,
-  httpOptions: {
-    headers: {
-      'User-Agent': 'aistudio-build',
-    },
-  },
-});
+// Lazy-initialize GoogleGenAI server-side with telemetry header
+let aiClient: GoogleGenAI | null = null;
+function getAiClient(): GoogleGenAI {
+  if (!aiClient) {
+    aiClient = new GoogleGenAI({
+      apiKey: process.env.GEMINI_API_KEY || 'missing-api-key',
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+  return aiClient;
+}
 
 // Endpoint to improve and cloak lyrics with Gemini AI
 app.post('/api/lyrics/improve', async (req, res) => {
@@ -108,6 +114,7 @@ Pertahankan semua baris, tanda kurung, dan ritme lagu. Hasilkan hanya teks lirik
       userPrompt = `Ubah lirik ini menjadi ejaan fonetik siluman anti-sensor untuk Suno:\n\n${lyrics}`;
     }
 
+    const ai = getAiClient();
     const response = await ai.models.generateContent({
       model: 'gemini-3.8-flash',
       contents: userPrompt,
@@ -160,7 +167,8 @@ function cleanAudioCache() {
     }
   }
 }
-setInterval(cleanAudioCache, 5 * 60 * 1000);
+const cacheCleanerTimer = setInterval(cleanAudioCache, 5 * 60 * 1000);
+cacheCleanerTimer.unref();
 
 async function resolveSunoSongId(rawUrl: string): Promise<string> {
   const trimmed = rawUrl.trim();
@@ -532,14 +540,22 @@ function transcodeAudio(
     if (targetFormat === 'ogg') {
       args = [
         '-i', 'pipe:0',
+        '-vn',
+        '-map_metadata', '-1',
+        '-ar', '44100',
+        '-ac', '2',
         '-c:a', 'libvorbis',
-        '-q:a', '4', // ~128-160kbps Vorbis, super lightweight (~2.5 - 3.5 MB)
+        '-q:a', '4', // True VBR quality 4 (nominal 128kbps, writes bitrate_max=0, bitrate_min=0 matching audio_sukses)
         '-f', 'ogg',
         'pipe:1',
       ];
     } else if (targetFormat === 'm4a') {
       args = [
         '-i', 'pipe:0',
+        '-vn',
+        '-map_metadata', '-1',
+        '-ar', '44100',
+        '-ac', '2',
         '-c:a', 'aac',
         '-b:a', '256k',
         '-movflags', 'frag_keyframe+empty_moov',
@@ -547,11 +563,16 @@ function transcodeAudio(
         'pipe:1',
       ];
     } else {
-      // Default: High-definition 320kbps MP3
+      // High-definition 320kbps MP3 with discrete stereo (-joint_stereo 0 prevents M/S mono zeroing)
       args = [
         '-i', 'pipe:0',
+        '-vn',
+        '-map_metadata', '-1',
+        '-ar', '44100',
+        '-ac', '2',
         '-c:a', 'libmp3lame',
         '-b:a', '320k',
+        '-joint_stereo', '0',
         '-f', 'mp3',
         'pipe:1',
       ];
@@ -682,9 +703,10 @@ app.post('/api/audio/encode-ogg', express.raw({ type: ['audio/*', 'application/o
 });
 
 // ==========================================
-// AUDIO ARMOR ENGINE (Anti-Audible Magic & Fingerprint Evasion)
+// AUDIO ARMOR ENGINE — CoSuProcessor Reference Implementation
 // ==========================================
 export type CanonicalArmorPreset = 'vocal_armor' | 'pulse_armor' | 'warm_armor';
+export type CoSuPresetKey = 'original' | 'staccato' | 'slow_tempo';
 export type ArmorFormatType = 'wav' | 'ogg' | 'mp3';
 
 interface ArmorOptions {
@@ -696,10 +718,16 @@ interface ArmorOptions {
   format?: ArmorFormatType;
 }
 
-const PITCH_SHIFT = 0.922333; // 2^(-1.4/12) -> transpose -1.4 semitones
-const TEMPO_VOCAL = 1.125407; // 0.922333 * 1.125407 = 1.038x net tempo (+3.8% speed breaks DTW bot)
-const TEMPO_PULSE = 1.138419; // 0.922333 * 1.138419 = 1.050x net tempo (+5% speed)
-const TEMPO_WARM = 1.098568;  // 0.933033 * 1.098568 = 1.025x net tempo (+2.5% speed)
+export interface AudioMetadataInfo {
+  duration: number;
+  sampleRate: number;
+  channels: number;
+  bitrate: number;
+  title: string;
+  artist: string;
+  format: string;
+  sizeBytes: number;
+}
 
 function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalArmorPreset {
   if (!rawPreset) return 'vocal_armor';
@@ -726,148 +754,273 @@ function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalAr
   return 'vocal_armor';
 }
 
-const pitchShiftCore = 'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
+function toCoSuPresetKey(rawPreset: string | undefined | null): CoSuPresetKey {
+  const canonical = normalizeArmorPreset(rawPreset);
+  if (canonical === 'warm_armor') return 'slow_tempo';
+  if (canonical === 'pulse_armor') return 'staccato';
+  return 'original';
+}
 
-function getArmorDspFilter(preset: string = 'original'): string {
-  const p = (preset || 'original').toLowerCase().trim();
+class CoSuProcessor {
+  public ffmpegPath: string;
+  public ffprobePath: string;
 
-  if (p === 'slow_tempo' || p === 'slow_ballad' || p === 'warm_armor') {
-    // 🌙 Slow Tempo / Ballad Shield (Formula Teruji 100% Lolos + Intonasi Pas & Manis)
-    // Chopper 5.5Hz (d=0.88) + Notch 1800Hz (-11dB) + Transpose -2 Semitones + Tempo Shift +5% (atempo=1.178585)
-    // In-Phase Stereo (c0=c0-c1|c1=c0-c1) anti-mono phase cancellation Suno AI
-    return 'pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2';
+  constructor() {
+    const isWin = process.platform === 'win32';
+    const isMac = process.platform === 'darwin';
+    const ffmpegBin = isWin ? 'ffmpeg.exe' : 'ffmpeg';
+    const ffprobeBin = isWin ? 'ffprobe.exe' : 'ffprobe';
+
+    this.ffmpegPath = this.resolveBinary(ffmpegBin, isMac ? 'mac' : '');
+    this.ffprobePath = this.resolveBinary(ffprobeBin, isMac ? 'mac' : '');
   }
 
-  if (p === 'staccato' || p === 'staccato_guide' || p === 'pulse_armor' || p === 'pulse') {
-    // ⚡ Staccato Guide Mode (On-Off Pulse ~22% with 50ms smooth ramp)
-    // Pulse ON (1.4s): cancel factor 0.78 (leaving ~22% faint ghost vocal for Suno pitch/melody tracker)
-    // Pulse OFF (1.6s): cancel factor 1.0 (100% hard kill to break Audible Magic continuous fingerprint)
-    // Highpass 250Hz + Pitch Shift -2 Semitones (0.8908987) + Volume 1.6x
-    return `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${pitchShiftCore},volume=1.6`;
+  ensureExecutable(filePath: string): string {
+    if (process.platform !== 'win32' && filePath && fs.existsSync(filePath)) {
+      try {
+        fs.chmodSync(filePath, 0o755);
+      } catch (_) {}
+    }
+    return filePath;
   }
 
-  // 🛡️ Original Pure SideHarmoni (Default / Vocal Armor)
-  return `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${pitchShiftCore},volume=1.6`;
-}
+  resolveBinary(binaryName: string, subFolder: string = ''): string {
+    const isMac = process.platform === 'darwin';
+    const resourcesPath = (process as NodeJS.Process & { resourcesPath?: string }).resourcesPath;
 
-function generateArmorFilename(
-  rawTitle: string,
-  rawPreset: string,
-  isFull: boolean,
-  duration: number,
-  format: ArmorFormatType = 'mp3'
-): string {
-  const base = (rawTitle || 'Audio')
-    .replace(/\.[^/.]+$/, '')
-    .replace(/[^a-zA-Z0-9_\-]/g, '_')
-    .replace(/_+/g, '_');
+    if (isMac && binaryName === 'ffmpeg') {
+      const isArm = process.arch === 'arm64';
+      const archName = isArm ? 'ffmpeg-arm64' : 'ffmpeg-x64';
 
-  const preset = normalizeArmorPreset(rawPreset);
-  const presetSuffix =
-    preset === 'pulse_armor' ? '_PulseArmor' : preset === 'warm_armor' ? '_WarmArmor' : '_VocalArmor';
-  const durLabel = isFull ? 'Full' : `${Math.round(duration)}s`;
-  const ext = format === 'wav' ? 'wav' : format === 'ogg' ? 'ogg' : 'mp3';
-
-  return `${base}${presetSuffix}_${durLabel}.${ext}`;
-}
-
-function probeAudioChannels(filePath: string): Promise<number> {
-  return new Promise((resolve) => {
-    const ffprobe = spawn('ffprobe', [
-      '-v',
-      'error',
-      '-select_streams',
-      'a:0',
-      '-show_entries',
-      'stream=channels',
-      '-of',
-      'default=noprint_wrappers=1:nokey=1',
-      filePath,
-    ]);
-    let out = '';
-    ffprobe.stdout.on('data', (d) => {
-      out += d.toString();
-    });
-    ffprobe.on('close', () => {
-      const parsed = parseInt(out.trim(), 10);
-      resolve(isNaN(parsed) || parsed < 1 ? 2 : parsed);
-    });
-    ffprobe.on('error', () => resolve(2));
-  });
-}
-
-async function runArmorFFmpeg(
-  inputBuffer: Buffer,
-  options: ArmorOptions
-): Promise<{ buffer: Buffer; filename: string; mimeType: string }> {
-  const isFull = options.mode === 'full';
-  const startTime = Math.max(0, options.startTime || 0);
-  const duration = Math.max(1, options.duration || 60.0);
-  const preset = normalizeArmorPreset(options.preset);
-  const format: ArmorFormatType = options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
-  const filename = generateArmorFilename(options.title || 'Track', preset, isFull, duration, format);
-  const mimeType = format === 'wav' ? 'audio/wav' : format === 'ogg' ? 'audio/ogg' : 'audio/mpeg';
-
-  const tmpId = crypto.randomBytes(8).toString('hex');
-  const tempInput = path.join(os.tmpdir(), `armor_in_${tmpId}.bin`);
-  const tempOutput = path.join(os.tmpdir(), `armor_out_${tmpId}.${format}`);
-
-  await fs.promises.writeFile(tempInput, inputBuffer);
-
-  try {
-    // Validate stereo channels
-    const channels = await probeAudioChannels(tempInput);
-    if (channels < 2) {
-      throw new Error(
-        'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja. Mohon gunakan berkas audio stereo.'
-      );
+      if (resourcesPath) {
+        const packagedArch = path.join(resourcesPath, 'bin', subFolder, archName);
+        if (fs.existsSync(packagedArch)) return this.ensureExecutable(packagedArch);
+      }
+      const localArch = path.resolve(__dirname, '..', 'bin', subFolder, archName);
+      if (fs.existsSync(localArch)) return this.ensureExecutable(localArch);
     }
 
-    const dspFilter = getArmorDspFilter(preset);
+    if (resourcesPath) {
+      if (subFolder) {
+        const packagedSubPath = path.join(resourcesPath, 'bin', subFolder, binaryName);
+        if (fs.existsSync(packagedSubPath)) return this.ensureExecutable(packagedSubPath);
+      }
+      const packagedPath = path.join(resourcesPath, 'bin', binaryName);
+      if (fs.existsSync(packagedPath)) return this.ensureExecutable(packagedPath);
+    }
 
-    // Exact arguments matching CoSuProcessor.exportStealthSeed:
-    const args: string[] = ['-y'];
+    if (subFolder) {
+      const localSubBin = path.resolve(__dirname, '..', 'bin', subFolder, binaryName);
+      if (fs.existsSync(localSubBin)) return this.ensureExecutable(localSubBin);
+    }
 
-    if (!isFull) {
-      args.push('-ss', startTime.toFixed(3), '-t', duration.toFixed(3));
-    } else {
-      if (startTime > 0) {
-        args.push('-ss', startTime.toFixed(3));
+    if (process.platform === 'darwin') {
+      const macPaths = [
+        `/opt/homebrew/bin/${binaryName}`,
+        `/usr/local/bin/${binaryName}`,
+        `/usr/bin/${binaryName}`,
+      ];
+      for (const p of macPaths) {
+        if (fs.existsSync(p)) return p;
       }
     }
 
-    args.push('-i', tempInput, '-vn', '-af', dspFilter, '-map_metadata', '-1');
+    const localBin = path.resolve(__dirname, '..', 'bin', binaryName);
+    if (fs.existsSync(localBin)) return this.ensureExecutable(localBin);
 
-    if (format === 'wav') {
-      args.push('-c:a', 'pcm_s16le', '-f', 'wav', tempOutput);
-    } else if (format === 'ogg') {
-      // Vorbis 128k persis seperti format Menari_Diatas_Luka...ogg yang 100% lolos verifikasi Suno
-      args.push('-c:a', 'libvorbis', '-b:a', '128k', '-f', 'ogg', tempOutput);
-    } else {
-      // libmp3lame 320k persis seperti CoSuProcessor
-      args.push('-c:a', 'libmp3lame', '-b:a', '320k', tempOutput);
+    return binaryName;
+  }
+
+  /**
+   * Mengambil durasi dan metadata audio menggunakan ffprobe
+   */
+  async getMetadata(filePath: string): Promise<AudioMetadataInfo> {
+    if (process.platform === 'darwin' && process.arch === 'arm64') {
+      const isSystemProbe =
+        this.ffprobePath.startsWith('/opt/homebrew') || this.ffprobePath.startsWith('/usr/local');
+      if (!isSystemProbe) {
+        try {
+          return await this.getMetadataViaFfmpeg(filePath);
+        } catch (_) {}
+      }
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const proc = spawn('ffmpeg', args);
+    return new Promise((resolve, reject) => {
+      const args = ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', filePath];
+
+      const probe = spawn(this.ffprobePath, args);
+      let stdout = '';
+      let stderr = '';
+
+      probe.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+      probe.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      probe.on('close', async (code) => {
+        if (code !== 0) {
+          try {
+            const fbData = await this.getMetadataViaFfmpeg(filePath);
+            return resolve(fbData);
+          } catch (fbErr: any) {
+            return reject(new Error(`ffprobe gagal membaca file: ${stderr} (${fbErr.message})`));
+          }
+        }
+        try {
+          const data = JSON.parse(stdout);
+          const duration = parseFloat(data.format?.duration || 0);
+          const audioStream = (data.streams || []).find((s: any) => s.codec_type === 'audio');
+
+          resolve({
+            duration,
+            sampleRate: audioStream ? parseInt(audioStream.sample_rate, 10) : 44100,
+            channels: audioStream ? audioStream.channels : 2,
+            bitrate: data.format?.bit_rate ? Math.round(parseInt(data.format.bit_rate, 10) / 1000) : 320,
+            title: data.format?.tags?.title || path.basename(filePath, path.extname(filePath)),
+            artist: data.format?.tags?.artist || 'Unknown Artist',
+            format: path.extname(filePath).replace('.', '').toUpperCase(),
+            sizeBytes: parseInt(data.format?.size || 0, 10),
+          });
+        } catch (err: any) {
+          try {
+            const fbData = await this.getMetadataViaFfmpeg(filePath);
+            resolve(fbData);
+          } catch (_) {
+            reject(new Error(`Gagal mem-parsing metadata audio: ${err.message}`));
+          }
+        }
+      });
+
+      probe.on('error', async () => {
+        try {
+          const fbData = await this.getMetadataViaFfmpeg(filePath);
+          resolve(fbData);
+        } catch (fbErr) {
+          reject(fbErr);
+        }
+      });
+    });
+  }
+
+  /**
+   * Fallback native parser metadata menggunakan ffmpeg -i langsung
+   */
+  async getMetadataViaFfmpeg(filePath: string): Promise<AudioMetadataInfo> {
+    return new Promise((resolve, reject) => {
+      const args = ['-i', filePath];
+      const proc = spawn(this.ffmpegPath, args);
+      let stderr = '';
+      proc.stderr.on('data', (d) => {
+        stderr += d.toString();
+      });
+      proc.on('close', () => {
+        const durMatch = stderr.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/i);
+        const brMatch = stderr.match(/bitrate:\s*(\d+)\s*kb\/s/i);
+        const srMatch = stderr.match(/(\d+)\s*Hz/i);
+        const isMono = /\bmono\b/i.test(stderr) && !/\bstereo\b/i.test(stderr);
+        if (durMatch) {
+          const hours = parseFloat(durMatch[1]);
+          const mins = parseFloat(durMatch[2]);
+          const secs = parseFloat(durMatch[3]);
+          const duration = hours * 3600 + mins * 60 + secs;
+          const stats = fs.existsSync(filePath) ? fs.statSync(filePath) : { size: 0 };
+          return resolve({
+            duration,
+            sampleRate: srMatch ? parseInt(srMatch[1], 10) : 44100,
+            channels: isMono ? 1 : 2,
+            bitrate: brMatch ? parseInt(brMatch[1], 10) : 320,
+            title: path.basename(filePath, path.extname(filePath)),
+            artist: 'Unknown Artist',
+            format: path.extname(filePath).replace('.', '').toUpperCase(),
+            sizeBytes: stats.size,
+          });
+        }
+        reject(new Error('Gagal mendeteksi durasi audio via FFmpeg fallback'));
+      });
+      proc.on('error', (err) => reject(err));
+    });
+  }
+
+  /**
+   * Mengambil string filter DSP FFmpeg berdasarkan preset
+   * Menggunakan formula native core FFmpeg (aresample pre-normalization + asetrate + aformat + atempo)
+   * Menjamin presisi matematis 100% pada file 44.1k, 48k (Suno v3.5/v4), dan 96k tanpa drift tempo / pitch.
+   */
+  getDspFilter(preset: string = 'original'): string {
+    const p = (preset || 'original').toLowerCase().trim();
+    const pitchShiftCore =
+      'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
+    // 16-bit triangular dither + 0.95 limiter matches manual converter output (audio_sukses) while keeping 100% symmetric phase cancellation
+    const postConditioner =
+      'alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16';
+
+    if (p === 'pulse_armor' || p === 'pulse' || p === 'rhythmic_chop' || p === 'slow_tempo') {
+      // ⚡ Pulse Armor (5.5Hz Tremolo Pulse + Bass +3dB + Notch 1800Hz + Transpose -2st + Tempo +5%)
+      return `pan=stereo|c0=c0-c1|c1=c0-c1,highpass=f=160,bass=g=3.0:f=180,equalizer=f=1800:t=q:w=1.2:g=-11,tremolo=f=5.5:d=0.88,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.178585,volume=2.2,${postConditioner}`;
+    }
+
+    if (p === 'warm_armor' || p === 'staccato' || p === 'staccato_guide' || p === 'slow_ballad' || p === 'ballad') {
+      // 🌙 Warm Armor (Smooth 3.0s ~22% Vocal Guide with 50ms ramp + Highpass 250Hz + Transpose -2st)
+      return `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
+    }
+
+    // 🛡️ Vocal Armor / Original Pure SideHarmoni (Default)
+    return `pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,${pitchShiftCore},volume=1.6,${postConditioner}`;
+  }
+
+  generateDefaultOutputPath(
+    inputPath: string,
+    options: { preset?: string; isFull?: boolean; duration?: number; format?: ArmorFormatType; title?: string } = {}
+  ): string {
+    const dir = path.dirname(inputPath);
+    const ext = path.extname(inputPath);
+    const rawBase = options.title || path.basename(inputPath, ext);
+    const base = (rawBase || 'Audio')
+      .replace(/\.[^/.]+$/, '')
+      .replace(/[^a-zA-Z0-9_\-]/g, '_')
+      .replace(/_+/g, '_');
+
+    const canonical = normalizeArmorPreset(options.preset);
+    const presetSuffix =
+      canonical === 'warm_armor'
+        ? '_WarmArmor'
+        : canonical === 'pulse_armor'
+        ? '_PulseArmor'
+        : '_VocalArmor';
+
+    const outExt = options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
+    if (options.isFull) {
+      return path.join(dir, `${base}${presetSuffix}_Full.${outExt}`);
+    }
+    const durLabel = options.duration ? `${Math.round(options.duration)}s` : '60s';
+    return path.join(dir, `${base}${presetSuffix}_${durLabel}.${outExt}`);
+  }
+
+  private runFfmpegStep(args: string[], onStderr?: (chunk: string) => void): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn(this.ffmpegPath, args);
       let stderr = '';
       const timer = setTimeout(() => {
         try {
           proc.kill('SIGKILL');
         } catch (_) {}
-        reject(new Error('FFmpeg Audio Armor execution timed out (240s).'));
+        reject(new Error('FFmpeg execution timed out (240s).'));
       }, 240000);
 
       proc.stderr.on('data', (d) => {
-        stderr += d.toString();
+        const s = d.toString();
+        stderr += s;
+        if (onStderr) onStderr(s);
       });
 
       proc.on('close', (code) => {
         clearTimeout(timer);
-        if (code === 0 && fs.existsSync(tempOutput)) {
+        if (code === 0) {
           resolve();
         } else {
-          reject(new Error(`FFmpeg Armor execution failed (code ${code}): ${stderr.slice(-300)}`));
+          reject(new Error(`FFmpeg gagal (code ${code}): ${stderr.slice(-400)}`));
         }
       });
 
@@ -876,12 +1029,292 @@ async function runArmorFFmpeg(
         reject(err);
       });
     });
+  }
+
+  /**
+   * Merender Side-Harmonic Stealth Cloak dengan 16-bit TPDF Dither & VBR Conditioning
+   */
+  async exportStealthSeed(
+    inputPath: string,
+    options: {
+      mode?: 'slice' | 'full';
+      startTime?: number;
+      duration?: number;
+      outputPath?: string;
+      preset?: string;
+      format?: ArmorFormatType;
+      title?: string;
+    } = {},
+    onProgress?: ((info: { stage: string; message: string }) => void) | null
+  ) {
+    const isFull = options.mode === 'full';
+    const startTime = Math.max(0, parseFloat(String(options.startTime || 0)));
+    const duration = parseFloat(String(options.duration || 60.0));
+    const canonicalPreset = normalizeArmorPreset(options.preset || 'original');
+    const format: ArmorFormatType =
+      options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
+    const outputPath =
+      options.outputPath ||
+      this.generateDefaultOutputPath(inputPath, {
+        preset: canonicalPreset,
+        isFull,
+        duration,
+        format,
+        title: options.title,
+      });
+
+    const outputDir = path.dirname(outputPath);
+    if (!fs.existsSync(outputDir)) {
+      fs.mkdirSync(outputDir, { recursive: true });
+    }
+
+    const dspFilter = this.getDspFilter(canonicalPreset);
+    const modeLabel =
+      canonicalPreset === 'warm_armor'
+        ? 'Warm Armor'
+        : canonicalPreset === 'pulse_armor'
+        ? 'Pulse Armor'
+        : 'Vocal Armor';
+
+    try {
+      const args = ['-y'];
+      if (!isFull) {
+        args.push('-ss', startTime.toFixed(3), '-t', duration.toFixed(3));
+      }
+      args.push(
+        '-i',
+        inputPath,
+        '-vn',
+        '-af',
+        dspFilter,
+        '-map_metadata',
+        '-1',
+        '-ar',
+        '44100',
+        '-ac',
+        '2'
+      );
+
+      if (format === 'wav') {
+        args.push('-fflags', '+bitexact', '-c:a', 'pcm_s16le', '-f', 'wav', outputPath);
+      } else if (format === 'ogg') {
+        // True VBR -q:a 4 writes bitrate_max=0, bitrate_min=0 in Vorbis ID header (identical to audio_sukses)
+        args.push('-c:a', 'libvorbis', '-q:a', '4', '-f', 'ogg', outputPath);
+      } else {
+        // Discrete stereo (-joint_stereo 0) + Xing header (-write_xing 1)
+        args.push(
+          '-c:a',
+          'libmp3lame',
+          '-b:a',
+          '320k',
+          '-joint_stereo',
+          '0',
+          '-write_xing',
+          '1',
+          '-f',
+          'mp3',
+          outputPath
+        );
+      }
+
+      await this.runFfmpegStep(args, () => {
+        if (onProgress) {
+          onProgress({
+            stage: 'processing',
+            message: isFull
+              ? `Menerapkan ${modeLabel} ke Full Lagu...`
+              : `Menerapkan ${modeLabel} ${duration}s...`,
+          });
+        }
+      });
+
+      if (fs.existsSync(outputPath)) {
+        const stats = fs.statSync(outputPath);
+        if (stats.size > 1000) {
+          return {
+            success: true,
+            outputPath,
+            filename: path.basename(outputPath),
+            duration: isFull ? ('FULL' as const) : duration,
+            startTime: isFull ? 0 : startTime,
+            isFull,
+            preset: canonicalPreset,
+            presetName: modeLabel,
+            sizeBytes: stats.size,
+          };
+        }
+      }
+
+      throw new Error('Hasil pemrosesan audio korup atau 0-byte.');
+    } catch (err) {
+      try {
+        if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
+      } catch (_) {}
+      throw err;
+    }
+  }
+
+  /**
+   * Merender cuplikan audio untuk preview live filter DSP (Original, Staccato Guide, atau Slow Tempo Shield)
+   * Bebas memory leak & sandboxing: Mengembalikan data URI Base64 dan membersihkan file temp dari disk.
+   */
+  async renderPreviewFilter(
+    inputPath: string,
+    startTime: number = 0,
+    duration: number = 15.0,
+    preset: string = 'original'
+  ): Promise<{ dataUri: string; buffer: Buffer }> {
+    const tempDir = path.join(os.tmpdir(), 'resu_cosu_previews');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    // 🧹 Auto-Purge: Hapus file preview lama yang berumur > 3 menit agar disk tidak penuh
+    try {
+      const files = fs.readdirSync(tempDir);
+      const now = Date.now();
+      for (const f of files) {
+        if (f.startsWith('preview_') && f.endsWith('.mp3')) {
+          const fp = path.join(tempDir, f);
+          const st = fs.statSync(fp);
+          if (now - st.mtimeMs > 3 * 60 * 1000) {
+            try {
+              fs.unlinkSync(fp);
+            } catch (_) {}
+          }
+        }
+      }
+    } catch (_) {}
+
+    const tempOutput = path.join(tempDir, `preview_${Date.now()}_${crypto.randomBytes(4).toString('hex')}.mp3`);
+    const cosuPreset = toCoSuPresetKey(preset);
+    const dspFilter = this.getDspFilter(cosuPreset);
+
+    const args = [
+      '-y',
+      '-ss',
+      Math.max(0, startTime).toFixed(3),
+      '-t',
+      duration.toFixed(3),
+      '-i',
+      inputPath,
+      '-vn',
+      '-af',
+      dspFilter,
+      '-map_metadata',
+      '-1',
+      '-c:a',
+      'libmp3lame',
+      '-b:a',
+      '256k',
+      tempOutput,
+    ];
+
+    return new Promise((resolve, reject) => {
+      const ffmpeg = spawn(this.ffmpegPath, args);
+      let stderr = '';
+      ffmpeg.stderr.on('data', (d) => {
+        stderr += d.toString();
+      });
+
+      ffmpeg.on('close', (code) => {
+        if (code === 0 && fs.existsSync(tempOutput)) {
+          try {
+            const buf = fs.readFileSync(tempOutput);
+            const base64Audio = `data:audio/mp3;base64,${buf.toString('base64')}`;
+            try {
+              fs.unlinkSync(tempOutput);
+            } catch (_) {}
+            resolve({ dataUri: base64Audio, buffer: buf });
+          } catch (readErr) {
+            try {
+              if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+            } catch (_) {}
+            reject(readErr);
+          }
+        } else {
+          try {
+            if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+          } catch (_) {}
+          reject(new Error(`Gagal merender audio preview siluman (code ${code}): ${stderr.slice(-300)}`));
+        }
+      });
+
+      ffmpeg.on('error', (err) => {
+        try {
+          if (fs.existsSync(tempOutput)) fs.unlinkSync(tempOutput);
+        } catch (_) {}
+        reject(err);
+      });
+    });
+  }
+}
+
+const cosuProcessor = new CoSuProcessor();
+
+async function runArmorFFmpeg(
+  inputBuffer: Buffer,
+  options: ArmorOptions
+): Promise<{ buffer: Buffer; filename: string; mimeType: string; presetName: string }> {
+  const isFull = options.mode === 'full';
+  const startTime = Math.max(0, options.startTime || 0);
+  const duration = Math.max(1, options.duration || 60.0);
+  const preset = normalizeArmorPreset(options.preset);
+  const format: ArmorFormatType =
+    options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
+  const mimeType =
+    format === 'wav' ? 'audio/wav' : format === 'ogg' ? 'audio/ogg' : 'audio/mpeg';
+
+  const tmpId = crypto.randomBytes(8).toString('hex');
+  const tempInput = path.join(os.tmpdir(), `armor_in_${tmpId}.bin`);
+  const filename = path.basename(
+    cosuProcessor.generateDefaultOutputPath(tempInput, {
+      preset,
+      isFull,
+      duration,
+      format,
+      title: options.title || 'Track',
+    })
+  );
+  const tempOutput = path.join(os.tmpdir(), `armor_out_${tmpId}_${filename}`);
+
+  await fs.promises.writeFile(tempInput, inputBuffer);
+
+  try {
+    // Validate stereo channels using CoSuProcessor.getMetadata
+    try {
+      const meta = await cosuProcessor.getMetadata(tempInput);
+      if (meta.channels < 2) {
+        throw new Error(
+          'Audio masukan bersifat Mono (1 kanal). Semua preset Audio Armor membutuhkan audio Stereo (2 kanal) agar pembatalan komponen tengah dan separasi fase dapat bekerja. Mohon gunakan berkas audio stereo.'
+        );
+      }
+    } catch (metaErr: any) {
+      if (metaErr?.message?.includes('Mono')) {
+        throw metaErr;
+      }
+    }
+
+    const exportInfo = await cosuProcessor.exportStealthSeed(tempInput, {
+      mode: isFull ? 'full' : 'slice',
+      startTime,
+      duration,
+      outputPath: tempOutput,
+      preset,
+      format,
+      title: options.title,
+    });
 
     const resultBuffer = await fs.promises.readFile(tempOutput);
     if (resultBuffer.length < 1000) {
       throw new Error('Hasil pemrosesan audio tidak valid atau terlalu kecil.');
     }
-    return { buffer: resultBuffer, filename, mimeType };
+    return {
+      buffer: resultBuffer,
+      filename,
+      mimeType,
+      presetName: exportInfo.presetName,
+    };
   } finally {
     try {
       if (fs.existsSync(tempInput)) await fs.promises.unlink(tempInput);
@@ -898,7 +1331,6 @@ async function getRequestAudioBuffer(req: express.Request): Promise<Buffer | nul
   if (typeof req.body === 'string' && req.body.length > 0) {
     return Buffer.from(req.body);
   }
-  // Fallback: Read raw stream directly if body-parser did not buffer
   try {
     const chunks: Buffer[] = [];
     for await (const chunk of req) {
@@ -911,7 +1343,29 @@ async function getRequestAudioBuffer(req: express.Request): Promise<Buffer | nul
   return null;
 }
 
-// Processing Endpoint - Returns High-Quality OGG / MP3 Seed
+// Endpoint: Probe audio metadata via CoSuProcessor.getMetadata
+app.post('/api/armor/metadata', express.raw({ type: () => true, limit: '200mb' }), async (req, res) => {
+  const tmpId = crypto.randomBytes(8).toString('hex');
+  const tempInput = path.join(os.tmpdir(), `probe_${tmpId}.bin`);
+  try {
+    const audioBuffer = await getRequestAudioBuffer(req);
+    if (!audioBuffer || audioBuffer.length === 0) {
+      res.status(400).json({ error: 'Buffer audio kosong.' });
+      return;
+    }
+    await fs.promises.writeFile(tempInput, audioBuffer);
+    const meta = await cosuProcessor.getMetadata(tempInput);
+    res.json({ success: true, metadata: meta });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Gagal membaca metadata audio.' });
+  } finally {
+    try {
+      if (fs.existsSync(tempInput)) await fs.promises.unlink(tempInput);
+    } catch (_) {}
+  }
+});
+
+// Processing Endpoint - Returns High-Quality MP3 320k / OGG / WAV Stealth Seed
 const handleArmorProcess = async (req: express.Request, res: express.Response) => {
   try {
     const audioBuffer = await getRequestAudioBuffer(req);
@@ -920,20 +1374,46 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
       return;
     }
 
-    const rawPreset = (req.query.preset as string) || (req.headers['x-armor-preset'] as string) || (req.headers['x-cosu-preset'] as string) || 'vocal_armor';
+    const rawPreset =
+      (req.query.preset as string) ||
+      (req.headers['x-armor-preset'] as string) ||
+      (req.headers['x-cosu-preset'] as string) ||
+      'original';
     const preset = normalizeArmorPreset(rawPreset);
-    const mode = (((req.query.mode as string) || (req.headers['x-armor-mode'] as string) || (req.headers['x-cosu-mode'] as string) || 'slice') as 'slice' | 'full');
-    const startTime = parseFloat((req.query.startTime as string) || (req.headers['x-armor-start-time'] as string) || (req.headers['x-cosu-start-time'] as string) || '0');
-    const duration = parseFloat((req.query.duration as string) || (req.headers['x-armor-duration'] as string) || (req.headers['x-cosu-duration'] as string) || '60.00');
-    const rawTitle = (req.query.title as string) || (req.headers['x-armor-title'] as string) || (req.headers['x-cosu-title'] as string) || 'Audio_Seed';
+    const mode = (((req.query.mode as string) ||
+      (req.headers['x-armor-mode'] as string) ||
+      (req.headers['x-cosu-mode'] as string) ||
+      'slice') as 'slice' | 'full');
+    const startTime = parseFloat(
+      (req.query.startTime as string) ||
+        (req.headers['x-armor-start-time'] as string) ||
+        (req.headers['x-cosu-start-time'] as string) ||
+        '0'
+    );
+    const duration = parseFloat(
+      (req.query.duration as string) ||
+        (req.headers['x-armor-duration'] as string) ||
+        (req.headers['x-cosu-duration'] as string) ||
+        '60.00'
+    );
+    const rawTitle =
+      (req.query.title as string) ||
+      (req.headers['x-armor-title'] as string) ||
+      (req.headers['x-cosu-title'] as string) ||
+      'Audio_Seed';
     let title = 'Audio_Seed';
     try {
       title = decodeURIComponent(rawTitle);
     } catch (_) {
       title = rawTitle;
     }
-    const rawFormat = ((req.query.format as string) || (req.headers['x-armor-format'] as string) || 'wav').toLowerCase();
-    const format: ArmorFormatType = rawFormat === 'mp3' ? 'mp3' : rawFormat === 'ogg' ? 'ogg' : 'wav';
+    const rawFormat = (
+      (req.query.format as string) ||
+      (req.headers['x-armor-format'] as string) ||
+      'mp3'
+    ).toLowerCase();
+    const format: ArmorFormatType =
+      rawFormat === 'wav' ? 'wav' : rawFormat === 'ogg' ? 'ogg' : 'mp3';
 
     const result = await runArmorFFmpeg(audioBuffer, {
       preset,
@@ -944,7 +1424,7 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
       format,
     });
 
-    const safeAsciiFilename = (result.filename || 'Armor_Audio.wav').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+    const safeAsciiFilename = (result.filename || 'Armor_Audio.mp3').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
     const encodedFilename = encodeURIComponent(result.filename || safeAsciiFilename);
 
     res.setHeader('Content-Type', result.mimeType);
@@ -966,8 +1446,10 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
 app.post('/api/armor/process', express.raw({ type: () => true, limit: '200mb' }), handleArmorProcess);
 app.post('/api/armor/process-cosu', express.raw({ type: () => true, limit: '200mb' }), handleArmorProcess);
 
-// Fast Preview Endpoint (15-25s Slice) for Instant In-Browser Listening
+// Fast Preview Endpoint (15s 256kbps MP3 via CoSuProcessor.renderPreviewFilter)
 const handleArmorPreview = async (req: express.Request, res: express.Response) => {
+  const tmpId = crypto.randomBytes(8).toString('hex');
+  const tempInput = path.join(os.tmpdir(), `preview_in_${tmpId}.bin`);
   try {
     const audioBuffer = await getRequestAudioBuffer(req);
     if (!audioBuffer || audioBuffer.length === 0) {
@@ -975,33 +1457,47 @@ const handleArmorPreview = async (req: express.Request, res: express.Response) =
       return;
     }
 
-    const rawPreset = (req.query.preset as string) || (req.headers['x-armor-preset'] as string) || 'vocal_armor';
-    const preset = normalizeArmorPreset(rawPreset);
+    const rawPreset =
+      (req.query.preset as string) || (req.headers['x-armor-preset'] as string) || 'original';
     const startTime = parseFloat((req.query.startTime as string) || '0');
-    const duration = Math.min(30, parseFloat((req.query.duration as string) || '20'));
-    const rawFormat = ((req.query.format as string) || (req.headers['x-armor-format'] as string) || 'mp3').toLowerCase();
-    const format: ArmorFormatType = rawFormat === 'ogg' ? 'ogg' : rawFormat === 'wav' ? 'wav' : 'mp3';
+    const duration = Math.min(30, parseFloat((req.query.duration as string) || '15.00'));
+    const responseType = (req.query.responseType as string) || '';
 
-    const result = await runArmorFFmpeg(audioBuffer, {
-      preset,
-      mode: 'slice',
+    await fs.promises.writeFile(tempInput, audioBuffer);
+
+    const previewResult = await cosuProcessor.renderPreviewFilter(
+      tempInput,
       startTime,
       duration,
-      title: 'Armor_Preview',
-      format,
-    });
+      rawPreset
+    );
 
-    res.setHeader('Content-Type', result.mimeType);
-    res.setHeader('Content-Length', result.buffer.length);
-    res.send(result.buffer);
+    if (responseType === 'dataUri' || req.headers.accept?.includes('application/json')) {
+      res.json({
+        success: true,
+        dataUri: previewResult.dataUri,
+        preset: toCoSuPresetKey(rawPreset),
+        startTime,
+        duration,
+      });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Length', previewResult.buffer.length);
+    res.send(previewResult.buffer);
   } catch (error: any) {
     console.error('Armor Preview Error:', error);
     res.status(500).json({ error: error.message || 'Gagal memutar preview Armor.' });
+  } finally {
+    try {
+      if (fs.existsSync(tempInput)) await fs.promises.unlink(tempInput);
+    } catch (_) {}
   }
 };
 
-app.post('/api/armor/preview', express.raw({ type: '*/*', limit: '200mb' }), handleArmorPreview);
-app.post('/api/armor/preview-cosu', express.raw({ type: '*/*', limit: '200mb' }), handleArmorPreview);
+app.post('/api/armor/preview', express.raw({ type: () => true, limit: '200mb' }), handleArmorPreview);
+app.post('/api/armor/preview-cosu', express.raw({ type: () => true, limit: '200mb' }), handleArmorPreview);
 
 // Endpoint 1: Parse and preview Suno song details
 app.post('/api/suno/parse', async (req, res) => {
