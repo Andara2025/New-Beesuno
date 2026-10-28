@@ -1,6 +1,7 @@
 import React, { useRef } from 'react';
-import { ArrowLeft, Zap, ShieldCheck, Waves, Image as ImageIcon, CheckCircle2, Download, Package } from 'lucide-react';
+import { ArrowLeft, Zap, ShieldCheck, Waves, Image as ImageIcon, CheckCircle2, Download, Package, Sparkles, Hash, Music2 } from 'lucide-react';
 import { AudioFileItem, AudioFormat, MasteringPreset, MetadataSettings } from '../types';
+import { resolveUniqueQueueTitles, cleanTitleFromFileName } from '../utils/c2paPurge';
 
 interface Step4CopyrightProps {
   files: AudioFileItem[];
@@ -8,6 +9,8 @@ interface Step4CopyrightProps {
   preset: MasteringPreset;
   metadata: MetadataSettings;
   setMetadata: (metadata: MetadataSettings) => void;
+  onUpdateFileTitle?: (id: string, newTitle: string) => void;
+  previousExportCounts?: Map<string, number>;
   onBack: () => void;
   onExecute: () => void;
   isProcessing: boolean;
@@ -22,6 +25,8 @@ export const Step4Copyright: React.FC<Step4CopyrightProps> = ({
   preset,
   metadata,
   setMetadata,
+  onUpdateFileTitle,
+  previousExportCounts,
   onBack,
   onExecute,
   isProcessing,
@@ -40,6 +45,16 @@ export const Step4Copyright: React.FC<Step4CopyrightProps> = ({
     m4a: 'M4A 320 kbps Apple',
   };
   const formatLabel = formatLabels[format];
+  const extStr = format === 'ogg' ? 'ogg' : format === 'mp3' ? 'mp3' : format === 'flac' ? 'flac' : format === 'm4a' ? 'm4a' : 'wav';
+
+  const resolvedTitleItems = resolveUniqueQueueTitles(
+    files,
+    metadata.titleMode,
+    metadata.customTitle,
+    previousExportCounts
+  );
+  const resolvedMap = new Map(resolvedTitleItems.map((r) => [r.id, r]));
+  const hasAnyDuplicateNumbering = resolvedTitleItems.some((r) => r.isDuplicateNumbered);
 
   const completedCount = files.filter((f) => f.status === 'completed').length;
   const isAllCompleted = files.length > 0 && completedCount === files.length;
@@ -86,44 +101,125 @@ export const Step4Copyright: React.FC<Step4CopyrightProps> = ({
           </div>
 
           {/* Title Mode */}
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-zinc-300">
-              Judul Lagu (Title):
-            </label>
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-medium text-zinc-300">
+                Judul Lagu (Title) &amp; Penomoran Otomatis:
+              </label>
+              <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20 flex items-center gap-1">
+                <Sparkles className="w-3 h-3" />
+                <span>Auto-Number Duplikat Aktif</span>
+              </span>
+            </div>
+
             <div className="grid grid-cols-2 gap-2">
               <button
                 type="button"
                 onClick={() => setMetadata({ ...metadata, titleMode: 'auto' })}
-                className={`py-2 px-3 rounded-xl text-xs font-medium border transition ${
+                className={`py-2.5 px-3 rounded-xl text-xs font-medium border transition flex items-center justify-center gap-1.5 ${
                   metadata.titleMode === 'auto'
                     ? 'bg-[#2c2e38] text-white border-white/20 shadow-sm font-medium'
                     : 'bg-white/[0.04] text-zinc-400 border-white/[0.08] hover:border-white/20'
                 }`}
               >
-                Otomatis (Nama File)
+                <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Auto Deteksi Judul Audio</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => setMetadata({ ...metadata, titleMode: 'custom' })}
-                className={`py-2 px-3 rounded-xl text-xs font-medium border transition ${
+                className={`py-2.5 px-3 rounded-xl text-xs font-medium border transition flex items-center justify-center gap-1.5 ${
                   metadata.titleMode === 'custom'
                     ? 'bg-[#2c2e38] text-white border-white/20 shadow-sm font-medium'
                     : 'bg-white/[0.04] text-zinc-400 border-white/[0.08] hover:border-white/20'
                 }`}
               >
-                Kustom Judul
+                <span>Kustom Judul</span>
               </button>
             </div>
 
             {metadata.titleMode === 'custom' && (
-              <input
-                type="text"
-                value={metadata.customTitle}
-                onChange={(e) => setMetadata({ ...metadata, customTitle: e.target.value })}
-                placeholder="Masukkan judul lagu..."
-                className="w-full bg-black/30 border border-white/[0.1] rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-white/30 mt-1 transition"
-              />
+              <div className="space-y-1">
+                <input
+                  type="text"
+                  value={metadata.customTitle}
+                  onChange={(e) => setMetadata({ ...metadata, customTitle: e.target.value })}
+                  placeholder="Masukkan judul lagu (jika >1 lagu, otomatis diberi nomor 1, 2, dst.)..."
+                  className="w-full bg-black/30 border border-white/[0.1] rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-white/30 transition"
+                />
+              </div>
+            )}
+
+            {/* Live Preview of Auto-Detected & Auto-Numbered Titles */}
+            {files.length > 0 && (
+              <div className="bg-black/30 border border-white/[0.08] rounded-xl p-3 space-y-2">
+                <div className="flex items-center justify-between text-[11px]">
+                  <span className="text-zinc-300 font-medium flex items-center gap-1.5">
+                    <Music2 className="w-3.5 h-3.5 text-zinc-400" />
+                    <span>
+                      {metadata.titleMode === 'auto'
+                        ? 'Hasil Auto-Deteksi Judul Audio:'
+                        : 'Preview Judul Kustom & Penomoran:'}
+                    </span>
+                  </span>
+                  {hasAnyDuplicateNumbering && (
+                    <span className="text-[10px] font-mono text-amber-300 bg-amber-500/10 border border-amber-500/20 px-1.5 py-0.5 rounded flex items-center gap-1">
+                      <Hash className="w-2.5 h-2.5" />
+                      <span>Judul Sama Otomatis Dinomori</span>
+                    </span>
+                  )}
+                </div>
+
+                <div className="max-h-36 overflow-y-auto space-y-1.5 pr-1">
+                  {files.map((f, idx) => {
+                    const rInfo = resolvedMap.get(f.id);
+                    const finalTitle = rInfo ? rInfo.resolvedTitle : cleanTitleFromFileName(f.name);
+                    const isDup = rInfo?.isDuplicateNumbered;
+                    const seqNum = rInfo?.sequenceNumber || idx + 1;
+
+                    return (
+                      <div
+                        key={f.id}
+                        className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-white/[0.03] border border-white/[0.06] rounded-lg px-2.5 py-1.5 text-xs"
+                      >
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <span className="text-[10px] font-mono text-zinc-500 shrink-0">
+                            {idx + 1}.
+                          </span>
+                          {metadata.titleMode === 'auto' && onUpdateFileTitle ? (
+                            <input
+                              type="text"
+                              value={f.detectedTitle ?? cleanTitleFromFileName(f.name)}
+                              onChange={(e) => onUpdateFileTitle(f.id, e.target.value)}
+                              title="Klik untuk mengedit judul dasar lagu ini"
+                              className="bg-transparent text-zinc-200 font-medium text-xs focus:outline-none focus:bg-black/40 focus:px-1.5 rounded w-full truncate border border-transparent focus:border-white/20"
+                            />
+                          ) : (
+                            <span className="text-zinc-300 truncate">{f.name}</span>
+                          )}
+                        </div>
+
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {metadata.titleMode === 'auto' && (
+                            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white/[0.05] text-zinc-400 border border-white/[0.06]">
+                              {f.titleSource === 'tag' ? 'Tag Audio' : 'Nama File'}
+                            </span>
+                          )}
+                          {isDup && (
+                            <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30 font-semibold">
+                              +#{seqNum}
+                            </span>
+                          )}
+                          <span className="text-[11px] font-mono text-emerald-300 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded truncate max-w-[190px]">
+                            {finalTitle}.{extStr}
+                          </span>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
             )}
           </div>
 
@@ -353,45 +449,56 @@ export const Step4Copyright: React.FC<Step4CopyrightProps> = ({
           </div>
 
           <div className="space-y-2">
-            {files.map((file) => (
-              <div
-                key={file.id}
-                className="bg-[#181920] border border-white/[0.06] rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-              >
-                <div className="min-w-0">
-                  <div className="font-semibold text-white truncate">{file.name}</div>
-                  <div className="text-[11px] text-zinc-400 font-mono mt-0.5">
-                    {file.status === 'completed'
-                      ? `✓ C2PA Purged • Master ${formatLabel} Ready`
-                      : file.status === 'processing'
-                      ? `${file.statusMessage || 'Memproses DSP mastering...'} (${file.progress}%)`
-                      : 'Menunggu antrean...'}
+            {files.map((file) => {
+              const rInfo = resolvedMap.get(file.id);
+              const finalTitle = file.resolvedTitle || rInfo?.resolvedTitle || cleanTitleFromFileName(file.name);
+              const downloadName = file.resultFileName || `${finalTitle}.${extStr}`;
+
+              return (
+                <div
+                  key={file.id}
+                  className="bg-[#181920] border border-white/[0.06] rounded-xl p-3 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-semibold text-white truncate flex items-center gap-2">
+                      <span>{finalTitle}</span>
+                      <span className="text-[10px] font-mono text-zinc-500 font-normal truncate">
+                        ({file.name})
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-zinc-400 font-mono mt-0.5">
+                      {file.status === 'completed'
+                        ? `✓ C2PA Purged • Judul ID3: "${finalTitle}" • ${formatLabel}`
+                        : file.status === 'processing'
+                        ? `${file.statusMessage || 'Memproses DSP mastering...'} (${file.progress}%)`
+                        : 'Menunggu antrean...'}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center gap-2 shrink-0">
+                    {file.status === 'processing' && (
+                      <div className="w-24 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-white transition-all duration-200"
+                          style={{ width: `${file.progress}%` }}
+                        ></div>
+                      </div>
+                    )}
+
+                    {file.status === 'completed' && file.resultUrl && (
+                      <a
+                        href={file.resultUrl}
+                        download={downloadName}
+                        className="bg-[#2c2e38] hover:bg-[#363845] text-white border border-white/15 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition shadow-sm active:scale-95"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        <span>Unduh ({downloadName})</span>
+                      </a>
+                    )}
                   </div>
                 </div>
-
-                <div className="flex items-center gap-2 shrink-0">
-                  {file.status === 'processing' && (
-                    <div className="w-24 h-1.5 bg-white/10 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-white transition-all duration-200"
-                        style={{ width: `${file.progress}%` }}
-                      ></div>
-                    </div>
-                  )}
-
-                  {file.status === 'completed' && file.resultUrl && (
-                    <a
-                      href={file.resultUrl}
-                      download={`Beesuno_${file.name.replace(/\.[^/.]+$/, '')}.${format === 'ogg' ? 'ogg' : format === 'mp3' ? 'mp3' : format === 'flac' ? 'flac' : format === 'm4a' ? 'm4a' : 'wav'}`}
-                      className="bg-[#2c2e38] hover:bg-[#363845] text-white border border-white/15 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition shadow-sm active:scale-95"
-                    >
-                      <Download className="w-3.5 h-3.5" />
-                      <span>Unduh File</span>
-                    </a>
-                  )}
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

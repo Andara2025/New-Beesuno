@@ -133,10 +133,17 @@ export const Step1InputAudio: React.FC<Step1InputAudioProps> = ({
                     {idx + 1}
                   </div>
                   <div className="min-w-0">
-                    <div className="text-xs sm:text-sm font-semibold text-white truncate">
-                      {item.name}
+                    <div className="text-xs sm:text-sm font-semibold text-white truncate flex items-center gap-2">
+                      <span>{item.detectedTitle || item.name}</span>
+                      {item.detectedTitle && (
+                        <span className="text-[10px] font-mono font-normal px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-300 border border-emerald-500/20">
+                          Auto Title
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 text-[11px] text-zinc-400 font-mono mt-0.5">
+                      <span className="truncate max-w-[160px] text-zinc-500">{item.name}</span>
+                      <span>•</span>
                       <span>{formatFileSize(item.size)}</span>
                       <span>•</span>
                       <span>{formatTime(item.duration)}</span>

@@ -24,6 +24,7 @@ import {
   SAMPLE_LYRICS_EN,
   SAMPLE_MAHALINI_MATIMATIAN,
   SAMPLE_MINANG_MALUMALU,
+  SAMPLE_CICAK_PARODI,
 } from '../utils/lyricsCloaker';
 import {
   arabicHomoglyphCloak,
@@ -372,9 +373,9 @@ export const LyricsCloakerView: React.FC = () => {
               </span>
               <span className="text-[10px] font-mono bg-white/[0.06] text-zinc-300 px-2 py-0.5 rounded border border-white/[0.08]">
                 {musicPreset === 'suno-monophone'
-                  ? '⭐ Monofon Suno (Direkomendasikan)'
+                  ? '⭐ Suku Kata Asimetris (Di-am, diam,)'
                   : musicPreset === 'syllable-pacing'
-                  ? 'Suku Kata Baku'
+                  ? '⭐ Soft-H Monofon (Dhiam, dhiam,)'
                   : musicPreset === 'natural-legato'
                   ? 'Natural Legato'
                   : 'Vowel-Shift Melodic'}
@@ -383,7 +384,7 @@ export const LyricsCloakerView: React.FC = () => {
 
             {/* 4 Presets Grid */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
-              {/* Preset 1: Monofon Suno (Utama) */}
+              {/* Preset 1: Suku Kata & Asimetris (Di-am, diam, + laut + Lah-lu) */}
               <button
                 type="button"
                 onClick={() => handleMusicPresetChange('suno-monophone')}
@@ -396,21 +397,21 @@ export const LyricsCloakerView: React.FC = () => {
                 <div>
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold flex items-center gap-1">
-                      <span>Monofon Suno</span>
-                      <span className="text-[10px] text-amber-300 font-normal">⭐ Pas</span>
+                      <span>Suku Kata Asimetris</span>
+                      <span className="text-[10px] text-emerald-300 font-normal">⭐ Lolos</span>
                     </span>
                     {musicPreset === 'suno-monophone' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
                   </div>
                   <div className={`text-[11px] mt-1 font-mono ${musicPreset === 'suno-monophone' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                    chin-ta, ter-chip-ta
+                    Di-am, diam, | di laut.
                   </div>
                 </div>
                 <div className="text-[10px] text-zinc-400 mt-2">
-                  Adaptasi fonetik Suno (huruf &apos;c&apos; dibaca /tʃ/, bukan &apos;k&apos;).
+                  Kata ulang pendek asimetris (<code className="text-zinc-300">Di-am, diam,</code>), <code className="text-zinc-300">laut</code> utuh &amp; <code className="text-zinc-300">Lah-lu</code>.
                 </div>
               </button>
 
-              {/* Preset 2: Suku Kata Baku */}
+              {/* Preset 2: Soft-H Monofon (Dhiam, dhiam, + laut + Lah-lu) */}
               <button
                 type="button"
                 onClick={() => handleMusicPresetChange('syllable-pacing')}
@@ -422,15 +423,18 @@ export const LyricsCloakerView: React.FC = () => {
               >
                 <div>
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-semibold">Suku Kata Baku (-)</span>
+                    <span className="text-xs font-semibold flex items-center gap-1">
+                      <span>Soft-H Monofon</span>
+                      <span className="text-[10px] text-emerald-300 font-normal">⭐ Halus</span>
+                    </span>
                     {musicPreset === 'syllable-pacing' && <CheckCircle2 className="w-3.5 h-3.5 text-zinc-200 shrink-0" />}
                   </div>
                   <div className={`text-[11px] mt-1 font-mono ${musicPreset === 'syllable-pacing' ? 'text-zinc-300' : 'text-zinc-500'}`}>
-                    cin-ta, ter-cip-ta
+                    Dhiam, dhiam, | Lah-lu
                   </div>
                 </div>
                 <div className="text-[10px] text-zinc-400 mt-2">
-                  Kaidah baku KBBI & diftong utuh tanpa ubah huruf.
+                  Sisipan <code className="text-zinc-300">h</code> halus (<code className="text-zinc-300">Dhiam</code> utuh tanpa dipenggal) agar vokal lebih mengalir.
                 </div>
               </button>
 
@@ -541,11 +545,11 @@ export const LyricsCloakerView: React.FC = () => {
               </div>
             </div>
 
-            {/* Helper note for zero-width */}
+            {/* Helper note */}
             <div className="text-[11px] text-zinc-400 flex items-start gap-1.5 bg-black/20 p-2 rounded-lg border border-white/[0.04]">
               <Info className="w-3.5 h-3.5 text-zinc-400 shrink-0 mt-0.5" />
               <span>
-                <strong>Tips Vokal Pas:</strong> Mode <em>Monofon Suno</em> secara otomatis mengubah ejaan &apos;c&apos; menjadi &apos;ch&apos; (seperti &apos;chin-ta&apos;) dan memenggal suku kata secara presisi sehingga AI Suno menyanyi dengan lafal asli Indonesia tanpa jeda gagap. Zero-Width disarankan dinonaktifkan agar vokal tidak tersendat.
+                <strong>Kaidah Lolos Suno 100%:</strong> Mode <em>Suku Kata &amp; Bait</em> memenggal semua kata bersuku kata ≥2 dengan tanda hubung rapat (seperti <code className="text-zinc-200">Di-am</code>, <code className="text-zinc-200">A-yam</code>, <code className="text-zinc-200">se-e-kor</code>), menjaga kata 1 suku kata tetap utuh (<code className="text-zinc-200">di</code>, <code className="text-zinc-200">Hap.</code>, <code className="text-zinc-200">Yuk.</code>), merapikan kata ulang dengan koma/spasi tanpa <code className="text-zinc-200"> - </code>, serta mengelompokkan bait per 2 baris.
               </span>
             </div>
           </div>
@@ -555,6 +559,18 @@ export const LyricsCloakerView: React.FC = () => {
       {/* Preset Quick Chips */}
       <div className="flex flex-wrap items-center gap-2 text-xs">
         <span className="text-zinc-500 font-mono text-[10px] uppercase">Contoh Cepat:</span>
+
+        <button
+          onClick={() => {
+            setLangMode('id');
+            setMusicPreset('suno-monophone');
+            setRawLyrics(SAMPLE_CICAK_PARODI);
+            setCloakedLyrics(generateOutput(SAMPLE_CICAK_PARODI, 'id', 'suno-monophone', arSubMode, cadenceMode, includeTags, ghostShield));
+          }}
+          className="bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border border-emerald-500/25 px-2.5 py-1 rounded-lg transition font-medium"
+        >
+          ⭐ Cicak-Cicak (Format Lolos 100%)
+        </button>
 
         <button
           onClick={() => {

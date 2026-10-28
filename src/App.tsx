@@ -13,7 +13,12 @@ import {
   MetadataSettings,
 } from './types';
 import { MASTERING_PRESETS } from './utils/presets';
-import { scanAndPurgeC2PA } from './utils/c2paPurge';
+import {
+  scanAndPurgeC2PA,
+  extractAudioMetadataAndTitle,
+  cleanTitleFromFileName,
+  resolveUniqueQueueTitles,
+} from './utils/c2paPurge';
 import { getAudioContext, generateSampleSunoAudio, renderMasterOffline } from './utils/audioEngine';
 import { exportMasterFile, encodeWav } from './utils/audioEncoder';
 
@@ -54,6 +59,7 @@ export default function App() {
   const [files, setFiles] = useState<AudioFileItem[]>([]);
   const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
+  const [exportedTitleCounts, setExportedTitleCounts] = useState<Map<string, number>>(() => new Map());
 
   // Modals
   const [historyModalOpen, setHistoryModalOpen] = useState<boolean>(false);
@@ -103,6 +109,8 @@ export default function App() {
         id: 'sample-' + Date.now(),
         file: demoFile,
         name: 'Ammber.mp3',
+        detectedTitle: 'Ammber',
+        titleSource: 'filename',
         size: 1420500, // ~1.4 MB
         duration: sampleBuffer.duration,
         sampleRate: sampleBuffer.sampleRate,
@@ -134,7 +142,7 @@ export default function App() {
   };
 
   /**
-   * Process uploaded files: scan C2PA manifests and decode AudioBuffers
+   * Process uploaded files: scan C2PA manifests, auto-detect embedded audio title, and decode AudioBuffers
    */
   const handleAddFiles = async (newFileList: FileList | File[]) => {
     const ctx = getAudioContext();
@@ -145,6 +153,7 @@ export default function App() {
       try {
         const arrayBuf = await file.arrayBuffer();
         const scanResult = scanAndPurgeC2PA(arrayBuf);
+        const titleMeta = extractAudioMetadataAndTitle(arrayBuf, file.name);
 
         // Decode audio data into AudioBuffer
         let audioBuffer: AudioBuffer | undefined;
@@ -159,6 +168,9 @@ export default function App() {
           id: `file-${Date.now()}-${i}`,
           file,
           name: file.name,
+          detectedTitle: titleMeta.title,
+          titleSource: titleMeta.source,
+          detectedArtist: titleMeta.artist,
           size: file.size,
           duration: audioBuffer ? audioBuffer.duration : 180,
           sampleRate: audioBuffer ? audioBuffer.sampleRate : 44100,
@@ -189,8 +201,14 @@ export default function App() {
     setFiles((prev) => prev.filter((f) => f.id !== id));
   };
 
+  const handleUpdateFileTitle = (id: string, newTitle: string) => {
+    setFiles((prev) =>
+      prev.map((f) => (f.id === id ? { ...f, detectedTitle: newTitle } : f))
+    );
+  };
+
   /**
-   * Execute batch mastering and sanitization
+   * Execute batch mastering and sanitization with Auto-Detect Title & Duplicate Auto-Numbering
    */
   const handleExecuteMastering = async () => {
     if (files.length === 0 || isProcessing) return;
@@ -199,8 +217,22 @@ export default function App() {
     let renderedCount = 0;
     const updatedFiles = [...files];
 
+    // Resolve unique titles across the batch and session export history
+    const resolvedTitleList = resolveUniqueQueueTitles(
+      updatedFiles,
+      metadata.titleMode,
+      metadata.customTitle,
+      exportedTitleCounts
+    );
+    const resolvedMap = new Map(resolvedTitleList.map((r) => [r.id, r]));
+    const nextExportCounts = new Map(exportedTitleCounts);
+
     for (let i = 0; i < updatedFiles.length; i++) {
       const item = updatedFiles[i];
+      const rInfo = resolvedMap.get(item.id);
+      const finalTitle = rInfo ? rInfo.resolvedTitle : cleanTitleFromFileName(item.name);
+      const baseKey = (rInfo ? rInfo.baseTitle : finalTitle).toLowerCase();
+
       item.status = 'processing';
       item.statusMessage = 'Membedah manifest C2PA & sidik jari...';
       item.progress = 15;
@@ -224,32 +256,40 @@ export default function App() {
           setFiles([...updatedFiles]);
         });
 
-        item.statusMessage = `Enkoding kontainer ${selectedFormat.toUpperCase()} & Tag ID3v2...`;
+        item.statusMessage = `Enkoding ${selectedFormat.toUpperCase()} & Tag Judul "${finalTitle}"...`;
         item.progress = 85;
         setFiles([...updatedFiles]);
 
-        // Export with format and clean ID3v2 metadata
+        // Export with format and clean ID3v2 metadata using the unique resolvedTitle
         const exportResult = await exportMasterFile(
           renderedBuffer,
           selectedFormat,
           metadata,
-          item.name
+          item.name,
+          finalTitle
         );
+
+        const safeFileTitle = finalTitle.replace(/[\\/:*?"<>|]/g, '_').trim() || 'Beesuno_Master';
+        const outputFileName = `${safeFileTitle}.${exportResult.ext}`;
 
         const resultUrl = URL.createObjectURL(exportResult.blob);
         item.resultBlob = exportResult.blob;
         item.resultUrl = resultUrl;
+        item.resolvedTitle = finalTitle;
+        item.resultFileName = outputFileName;
         item.status = 'completed';
         item.progress = 100;
         item.statusMessage = 'Master selesai!';
         renderedCount++;
+
+        nextExportCounts.set(baseKey, (nextExportCounts.get(baseKey) || 0) + 1);
         setFiles([...updatedFiles]);
 
-        // Auto download if enabled and single file
-        if (autoDownload && updatedFiles.length === 1) {
+        // Auto download if enabled
+        if (autoDownload) {
           const downloadAnchor = document.createElement('a');
           downloadAnchor.href = resultUrl;
-          downloadAnchor.download = `Beesuno_${item.name.replace(/\.[^/.]+$/, '')}.${exportResult.ext}`;
+          downloadAnchor.download = outputFileName;
           document.body.appendChild(downloadAnchor);
           downloadAnchor.click();
           document.body.removeChild(downloadAnchor);
@@ -262,6 +302,7 @@ export default function App() {
       }
     }
 
+    setExportedTitleCounts(nextExportCounts);
     setIsProcessing(false);
     setStats((prev) => ({
       ...prev,
@@ -270,7 +311,7 @@ export default function App() {
   };
 
   /**
-   * Bundles all rendered files into a single ZIP archive
+   * Bundles all rendered files into a single ZIP archive with collision-free auto-numbered names
    */
   const handleDownloadZip = async () => {
     const completedFiles = files.filter((f) => f.status === 'completed' && f.resultBlob);
@@ -278,12 +319,24 @@ export default function App() {
 
     const zip = new JSZip();
     const folder = zip.folder('Beesuno_Studio_Masters');
+    const usedZipNames = new Map<string, number>();
 
     for (const item of completedFiles) {
       if (item.resultBlob) {
         const ext = selectedFormat === 'ogg' ? 'ogg' : selectedFormat === 'mp3' ? 'mp3' : selectedFormat === 'flac' ? 'flac' : selectedFormat === 'm4a' ? 'm4a' : 'wav';
-        const cleanName = `Beesuno_${item.name.replace(/\.[^/.]+$/, '')}.${ext}`;
-        folder?.file(cleanName, item.resultBlob);
+        const baseTitle = (item.resolvedTitle || item.detectedTitle || cleanTitleFromFileName(item.name)).replace(/[\\/:*?"<>|]/g, '_').trim();
+        let candidateName = item.resultFileName || `${baseTitle}.${ext}`;
+        const lowerKey = candidateName.toLowerCase();
+
+        if (usedZipNames.has(lowerKey)) {
+          const nextNum = (usedZipNames.get(lowerKey) || 1) + 1;
+          usedZipNames.set(lowerKey, nextNum);
+          candidateName = `${baseTitle} ${nextNum}.${ext}`;
+        } else {
+          usedZipNames.set(lowerKey, 1);
+        }
+
+        folder?.file(candidateName, item.resultBlob);
       }
     }
 
@@ -417,6 +470,8 @@ export default function App() {
                       preset={preset}
                       metadata={metadata}
                       setMetadata={setMetadata}
+                      onUpdateFileTitle={handleUpdateFileTitle}
+                      previousExportCounts={exportedTitleCounts}
                       onBack={() => setCurrentStep(3)}
                       onExecute={handleExecuteMastering}
                       isProcessing={isProcessing}

@@ -32,6 +32,7 @@ import {
   getPresetMeta,
   buildArmorOutputFilename,
   getPulseArmorK,
+  getTempoArmorK,
   ARMOR_CONSTANTS,
   ArmorPresetMeta,
 } from '../utils/armorPresets';
@@ -52,6 +53,7 @@ export interface SunoUploadArmorViewProps {
 export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavigateTab }) => {
   // Preset & Processing Options
   const [selectedPreset, setSelectedPreset] = useState<CanonicalArmorPresetId>(DEFAULT_ARMOR_PRESET);
+  const [tempoShiftPercent, setTempoShiftPercent] = useState<number>(ARMOR_CONSTANTS.TEMPO_SLOWEST_DEFAULT);
   const [durationMode, setDurationMode] = useState<'full' | '60s' | 'custom'>('full');
   const [customDuration, setCustomDuration] = useState<number>(60);
   const [armorFormat, setArmorFormat] = useState<ArmorFormatType>('mp3');
@@ -160,7 +162,8 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   const startLocalPlayback = (
     startOffset = 0,
     presetOverride?: CanonicalArmorPresetId,
-    modeOverride?: 'armor' | 'original'
+    modeOverride?: 'armor' | 'original',
+    tempoShiftOverride?: number
   ) => {
     if (!audioBuffer) return;
     // Keep playing state active so UI doesn't flicker during seamless seek
@@ -176,6 +179,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
     const activeMode = modeOverride !== undefined ? modeOverride : abMode;
     const activePreset = normalizePreset(presetOverride !== undefined ? presetOverride : selectedPreset);
+    const activeTempoShift = tempoShiftOverride !== undefined ? tempoShiftOverride : tempoShiftPercent;
 
     const ctx = getAudioContext();
     audioContextRef.current = ctx;
@@ -232,15 +236,26 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         const staccatoBuffer = ctx.createBuffer(2, numSamples, sr);
         const outL = staccatoBuffer.getChannelData(0);
         const outR = staccatoBuffer.getChannelData(1);
+
+        const tempoVocalBuffer = ctx.createBuffer(2, numSamples, sr);
+        const tempoL = tempoVocalBuffer.getChannelData(0);
+        const tempoR = tempoVocalBuffer.getChannelData(1);
+
         for (let i = 0; i < numSamples; i++) {
-          const k = getPulseArmorK(i / sr);
-          outL[i] = shiftedL[i] - k * shiftedR[i];
-          outR[i] = shiftedR[i] - k * shiftedL[i];
+          const tSec = i / sr;
+          const kWarm = getPulseArmorK(tSec);
+          outL[i] = shiftedL[i] - kWarm * shiftedR[i];
+          outR[i] = shiftedR[i] - kWarm * shiftedL[i];
+
+          const kTempo = getTempoArmorK(tSec);
+          tempoL[i] = shiftedL[i] - kTempo * shiftedR[i];
+          tempoR[i] = shiftedR[i] - kTempo * shiftedL[i];
         }
 
         pulseBufferCacheRef.current = {
           source: audioBuffer,
           processed: staccatoBuffer,
+          tempoVocal: tempoVocalBuffer,
           pitched: pitchedStereo,
         } as any;
       }
@@ -248,6 +263,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       const cache = pulseBufferCacheRef.current as unknown as {
         source: AudioBuffer;
         processed: AudioBuffer;
+        tempoVocal: AudioBuffer;
         pitched: AudioBuffer;
       };
 
@@ -314,6 +330,31 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
         chainOut = tremoloGain;
         rate = 0.8908987 * 1.178585; // 1.05x net tempo with -2 semitones pitch already baked in
+      } else if (activePreset === 'tempo_armor') {
+        // ⏱️ Tempo Armor (Vocal-Forward 42%..22% Continuous Guide + 150Hz Warm Body + Vocal Presence EQ + Flexible Tempo Shift)
+        source.buffer = cache.tempoVocal;
+
+        const highpass = ctx.createBiquadFilter();
+        highpass.type = 'highpass';
+        highpass.frequency.value = 150;
+
+        const vocalBody = ctx.createBiquadFilter();
+        vocalBody.type = 'peaking';
+        vocalBody.frequency.value = 1350;
+        vocalBody.Q.value = 1.1;
+        vocalBody.gain.value = 2.8;
+
+        const vocalPresence = ctx.createBiquadFilter();
+        vocalPresence.type = 'peaking';
+        vocalPresence.frequency.value = 2600;
+        vocalPresence.Q.value = 1.0;
+        vocalPresence.gain.value = 4.2;
+
+        source.connect(highpass);
+        highpass.connect(vocalBody);
+        vocalBody.connect(vocalPresence);
+        chainOut = vocalPresence;
+        rate = Math.max(0.7, Math.min(1.3, 1 + activeTempoShift / 100));
       } else if (activePreset === 'warm_armor') {
         // 🌙 Warm Armor (Smooth 3.0s ON 0.78 (1.4s) / OFF 1.0 (1.6s) with 50ms ramp, no chopper tremolo)
         source.buffer = cache.processed;
@@ -324,7 +365,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
         source.connect(highpass);
         chainOut = highpass;
-        rate = 1.0; // 1.0x net tempo with -2 semitones pitch already baked in
+        rate = 1.0;
       } else {
         // 🛡️ Vocal Armor / Original Pure SideHarmoni (CoSuProcessor: pan=stereo|c0=c0-c1|c1=c1-c0,highpass=f=250,pitchShiftCore,volume=1.6)
         source.buffer = cache.pitched;
@@ -366,7 +407,12 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       source.playbackRate.value = rate;
 
       const volumeGain = ctx.createGain();
-      volumeGain.gain.value = activePreset === 'pulse_armor' ? 2.2 : 1.6;
+      volumeGain.gain.value =
+        activePreset === 'pulse_armor'
+          ? 2.2
+          : activePreset === 'tempo_armor'
+          ? 1.75
+          : 1.6;
 
       chainOut.connect(volumeGain);
       volumeGain.connect(limiter);
@@ -491,7 +537,24 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     setSelectedPreset(presetId);
     if (isPlaying) {
       const cur = currentTime;
-      startLocalPlayback(cur, presetId, abMode);
+      startLocalPlayback(cur, presetId, abMode, tempoShiftPercent);
+    }
+  };
+
+  // Handle Live Tempo Shift Change (Smooth Real-Time Update Without Stopping Audio)
+  const handleTempoShiftChange = (newShift: number) => {
+    const clamped = Math.max(-25, Math.min(20, Math.round(newShift)));
+    setTempoShiftPercent(clamped);
+    if (isPlaying && selectedPreset === 'tempo_armor' && abMode === 'armor') {
+      const ctx = audioContextRef.current;
+      if (ctx && sourceNodeRef.current && audioBuffer) {
+        const elapsed = (ctx.currentTime - playbackStartTimeRef.current) * playbackRateRef.current;
+        playbackOffsetRef.current = Math.min(audioBuffer.duration, playbackOffsetRef.current + elapsed);
+        playbackStartTimeRef.current = ctx.currentTime;
+        const newRate = Math.max(0.7, Math.min(1.3, 1 + clamped / 100));
+        playbackRateRef.current = newRate;
+        sourceNodeRef.current.playbackRate.value = newRate;
+      }
     }
   };
 
@@ -715,14 +778,19 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     const preset = normalizePreset(presetId);
     const isPulse = preset === 'pulse_armor';
     const isWarm = preset === 'warm_armor';
+    const isTempo = preset === 'tempo_armor';
 
     const sr = sourceBuffer.sampleRate;
     const startSample = isFull ? 0 : Math.min(Math.floor(Math.max(0, startOffset) * sr), Math.max(0, sourceBuffer.length - sr));
     const maxSamples = isFull ? sourceBuffer.length - startSample : Math.min(sourceBuffer.length - startSample, Math.floor((targetDuration || 60.0) * sr));
     const sliceLen = Math.max(1024, maxSamples);
 
-    // Pitch is shifted -200 cents (-2 semitones) independently via WSOLA; net tempo rate is 1.05x for Pulse Armor and 1.0x for Vocal/Warm Armor
-    const netRate = isPulse ? 0.8908987 * 1.178585 : 1.0;
+    // Net tempo rate: 1.05x for Pulse Armor, (1 + tempoShift/100) for Tempo Armor, 1.0x for Vocal/Warm Armor
+    const netRate = isPulse
+      ? 0.8908987 * 1.178585
+      : isTempo
+      ? Math.max(0.7, Math.min(1.3, 1 + tempoShiftPercent / 100))
+      : 1.0;
     const outLength = Math.max(1024, Math.floor(sliceLen / netRate));
 
     const offlineCtx = new OfflineAudioContext(2, outLength, sr);
@@ -738,6 +806,11 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
         const diff = inL[i] - inR[i];
         rawCh0[i] = diff;
         rawCh1[i] = diff;
+      } else if (isTempo) {
+        // ⏱️ Tempo Armor: continuous vocal-forward 42%..22% vocal guide (never muting to 0%)
+        const k = getTempoArmorK(i / sr);
+        rawCh0[i] = inL[i] - k * inR[i];
+        rawCh1[i] = inR[i] - k * inL[i];
       } else if (isWarm) {
         // 🌙 Warm Armor: smooth 3.0s vocal guide k(t) with 100% pure symmetric phase cancellation
         const k = getPulseArmorK(i / sr);
@@ -751,9 +824,10 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       }
     }
 
-    // Apply -2 semitones (-200 cents) time-domain pitch shift while preserving tempo
-    const shiftedCh0 = applyTimeDomainPitchShift(rawCh0, -200, sr);
-    const shiftedCh1 = applyTimeDomainPitchShift(rawCh1, -200, sr);
+    // Compensate WSOLA pitch shift for netRate resampling so final exported pitch stays locked at -200 cents (-2 semitones)
+    const targetWsolaCents = -200 - 1200 * Math.log2(netRate);
+    const shiftedCh0 = Math.abs(targetWsolaCents) < 5 ? rawCh0 : applyTimeDomainPitchShift(rawCh0, targetWsolaCents, sr);
+    const shiftedCh1 = Math.abs(targetWsolaCents) < 5 ? rawCh1 : applyTimeDomainPitchShift(rawCh1, targetWsolaCents, sr);
     phaseBuffer.copyToChannel(shiftedCh0 as Float32Array<ArrayBuffer>, 0);
     phaseBuffer.copyToChannel(shiftedCh1 as Float32Array<ArrayBuffer>, 1);
 
@@ -763,10 +837,10 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
 
     const highpass = offlineCtx.createBiquadFilter();
     highpass.type = 'highpass';
-    highpass.frequency.value = isPulse ? 160 : 250;
+    highpass.frequency.value = isPulse ? 160 : isTempo ? 150 : 250;
 
     const volGain = offlineCtx.createGain();
-    volGain.gain.value = isPulse ? 2.2 : 1.6;
+    volGain.gain.value = isPulse ? 2.2 : isTempo ? 1.75 : 1.6;
 
     if (isPulse) {
       const bassFilter = offlineCtx.createBiquadFilter();
@@ -797,6 +871,23 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       bassFilter.connect(notchFilter);
       notchFilter.connect(tremoloGain);
       tremoloGain.connect(volGain);
+    } else if (isTempo) {
+      const vocalBody = offlineCtx.createBiquadFilter();
+      vocalBody.type = 'peaking';
+      vocalBody.frequency.value = 1350;
+      vocalBody.Q.value = 1.1;
+      vocalBody.gain.value = 2.8;
+
+      const vocalPresence = offlineCtx.createBiquadFilter();
+      vocalPresence.type = 'peaking';
+      vocalPresence.frequency.value = 2600;
+      vocalPresence.Q.value = 1.0;
+      vocalPresence.gain.value = 4.2;
+
+      srcNode.connect(highpass);
+      highpass.connect(vocalBody);
+      vocalBody.connect(vocalPresence);
+      vocalPresence.connect(volGain);
     } else {
       srcNode.connect(highpass);
       highpass.connect(volGain);
@@ -901,6 +992,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             duration: (isFull ? 480.0 : targetDuration).toString(),
             title: cleanTitle,
             format: armorFormat,
+            tempoShift: tempoShiftPercent.toString(),
           });
 
           const controller = new AbortController();
@@ -1217,7 +1309,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
           </span>
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
           {ARMOR_PRESETS_LIST.map((p) => {
             const isSelected = selectedPreset === p.id;
             return (
@@ -1256,6 +1348,93 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
             );
           })}
         </div>
+
+        {/* Interactive Tempo Adjustment Slider for Tempo Armor */}
+        {selectedPreset === 'tempo_armor' && (
+          <div className="bg-[#181a24] border border-sky-500/30 rounded-xl p-4 space-y-3 shadow-sm">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Sliders className="w-3.5 h-3.5 text-sky-400" />
+                  <span className="text-xs font-semibold text-white">
+                    Penyesuaian Tempo & Vokal Menonjol (Vokal Jelas + Tempo Shift)
+                  </span>
+                </div>
+                <p className="text-[11px] text-zinc-400 mt-0.5">
+                  Vokal didorong lebih jelas di depan tanpa pernah hilang, dipadukan dengan perlambatan (Slowdown) atau percepatan (Speed Up) agar tetap lolos deteksi.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <span className={`text-xs font-mono font-semibold px-2.5 py-1 rounded-lg border ${
+                  tempoShiftPercent < 0
+                    ? 'bg-sky-500/15 text-sky-300 border-sky-500/30'
+                    : tempoShiftPercent > 0
+                    ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                    : 'bg-white/[0.06] text-zinc-300 border-white/10'
+                }`}>
+                  {tempoShiftPercent > 0 ? `+${tempoShiftPercent}%` : `${tempoShiftPercent}%`} ({tempoShiftPercent < 0 ? 'Slowdown' : tempoShiftPercent > 0 ? 'Speed Up' : 'Normal'})
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleTempoShiftChange(-12)}
+                  className="text-[10px] font-mono px-2 py-1 rounded-lg bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 border border-white/10 transition"
+                  title="Reset ke rekomendasi utama -12%"
+                >
+                  Reset (-12%)
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-1.5">
+              <input
+                type="range"
+                min={-25}
+                max={20}
+                step={1}
+                value={tempoShiftPercent}
+                onChange={(e) => handleTempoShiftChange(parseFloat(e.target.value))}
+                className="w-full accent-sky-400 cursor-pointer h-1.5 bg-zinc-800 rounded-lg"
+              />
+              <div className="flex justify-between text-[10px] font-mono text-zinc-500">
+                <span>-25% (Sangat Lambat)</span>
+                <span>-12% (Default Slowest ★)</span>
+                <span>0% (Normal)</span>
+                <span>+20% (Cepat)</span>
+              </div>
+            </div>
+
+            {/* Quick Recommendation Chips */}
+            <div className="pt-1 flex flex-wrap items-center gap-1.5">
+              <span className="text-[10px] text-zinc-400 mr-1">Rekomendasi Lagu:</span>
+              {[
+                { val: -18, label: '-18% (Ekstra Lambat / Lagu Ketat)' },
+                { val: -12, label: '-12% (Slowest Default ★)' },
+                { val: -8, label: '-8% (Slowdown Natural / Ballad)' },
+                { val: -5, label: '-5% (Sentuhan Halus)' },
+                { val: 5, label: '+5% (Speed Up Halus / Pop)' },
+                { val: 8, label: '+8% (Upbeat / Groove)' },
+                { val: 12, label: '+12% (Fast Remix / EDM)' },
+              ].map((presetChip) => {
+                const active = tempoShiftPercent === presetChip.val;
+                return (
+                  <button
+                    key={presetChip.val}
+                    type="button"
+                    onClick={() => handleTempoShiftChange(presetChip.val)}
+                    className={`text-[10px] font-mono px-2.5 py-1 rounded-lg border transition ${
+                      active
+                        ? 'bg-sky-500/20 text-sky-200 border-sky-400/50 font-semibold'
+                        : 'bg-white/[0.04] text-zinc-400 hover:text-zinc-200 border-white/[0.06]'
+                    }`}
+                  >
+                    {presetChip.label}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Main Grid: Controls & Player (Left 7 cols) & Execution Summary (Right 5 cols) */}
@@ -1648,7 +1827,11 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
               <div className="flex items-center justify-between py-1.5 border-b border-white/[0.04]">
                 <span className="text-zinc-400">Tempo Lagu:</span>
                 <span className="font-medium text-zinc-300">
-                  {activePresetObj.tempo}
+                  {selectedPreset === 'tempo_armor'
+                    ? `${tempoShiftPercent > 0 ? `+${tempoShiftPercent}` : tempoShiftPercent}% (${
+                        tempoShiftPercent < 0 ? 'Slowdown' : tempoShiftPercent > 0 ? 'Speed Up' : 'Normal'
+                      })`
+                    : activePresetObj.tempo}
                 </span>
               </div>
 

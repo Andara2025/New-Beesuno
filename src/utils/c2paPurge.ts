@@ -200,3 +200,267 @@ export function buildCleanId3v2Tag(options: {
 
   return tagBuffer;
 }
+
+/**
+ * Membersihkan nama file menjadi judul lagu yang rapi tanpa ekstensi atau embel-embel teknis
+ */
+export function cleanTitleFromFileName(fileName: string): string {
+  if (!fileName) return 'Untitled Track';
+
+  // 1. Hapus ekstensi file (.mp3, .wav, .ogg, .m4a, .flac, dll.)
+  let clean = fileName.replace(/\.[^/.]+$/, '');
+
+  // 2. Hapus prefix/suffix teknis dari proses sebelumnya atau OS copy
+  clean = clean
+    .replace(/^Beesuno_/i, '')
+    .replace(/_SunoMaster$/i, '')
+    .replace(/_(?:Vocal|Pulse|Warm|Tempo)Armor(?:_FULL|_\d+s)?$/i, '')
+    .replace(/\s*\(\d+\)\s*$/, '') // hapus "(1)", "(2)" bawaan browser download agar ditata ulang secara konsisten
+    .replace(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}[_-]?/i, '');
+
+  // 3. Ubah underscore berlebih menjadi spasi yang rapi
+  clean = clean.replace(/_+/g, ' ').replace(/\s{2,}/g, ' ').trim();
+
+  return clean || 'Untitled Track';
+}
+
+/**
+ * Membaca teks dari frame ID3v2 (mendukung ISO-8859-1, UTF-16, UTF-16BE, dan UTF-8)
+ */
+function decodeId3TextPayload(payload: Uint8Array): string {
+  if (!payload || payload.length <= 1) return '';
+  const encoding = payload[0];
+  const textBytes = payload.subarray(1);
+
+  try {
+    let raw = '';
+    if (encoding === 0) {
+      // ISO-8859-1 / Latin1
+      raw = new TextDecoder('iso-8859-1').decode(textBytes);
+    } else if (encoding === 1) {
+      // UTF-16 with BOM
+      raw = new TextDecoder('utf-16').decode(textBytes);
+    } else if (encoding === 2) {
+      // UTF-16BE without BOM
+      raw = new TextDecoder('utf-16be').decode(textBytes);
+    } else {
+      // UTF-8 (encoding === 3)
+      raw = new TextDecoder('utf-8').decode(textBytes);
+    }
+    return raw.replace(/\0+/g, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Ekstraksi otomatis Judul Lagu (Title) & Artis langsung dari biner file audio
+ * Mendukung:
+ * 1. Tag ID3v2.3 / ID3v2.4 (TIT2 / TPE1) pada MP3/WAV
+ * 2. Atom M4A / MP4 (©nam / ©ART)
+ * 3. Vorbis Comment OGG / FLAC (TITLE= / ARTIST=)
+ * 4. RIFF WAV INFO Chunk (INAM / IART)
+ * 5. Fallback otomatis ke Nama File yang sudah dibersihkan
+ */
+export function extractAudioMetadataAndTitle(
+  buffer: ArrayBuffer,
+  fileName: string
+): { title: string; artist?: string; source: 'tag' | 'filename' } {
+  const bytes = new Uint8Array(buffer);
+  let detectedTitle = '';
+  let detectedArtist = '';
+
+  // 1. Cek Tag ID3v2 di awal file ("ID3")
+  if (bytes.length > 14 && bytes[0] === 0x49 && bytes[1] === 0x44 && bytes[2] === 0x33) {
+    const version = bytes[3]; // 3 = ID3v2.3, 4 = ID3v2.4
+    const tagSize =
+      ((bytes[6] & 0x7f) << 21) |
+      ((bytes[7] & 0x7f) << 14) |
+      ((bytes[8] & 0x7f) << 7) |
+      (bytes[9] & 0x7f);
+    const limit = Math.min(bytes.length, 10 + tagSize);
+    let pos = 10;
+
+    while (pos + 10 <= limit) {
+      const id = String.fromCharCode(bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]);
+      if (!/^[A-Z0-9]{4}$/.test(id)) break;
+
+      let frameSize = 0;
+      if (version === 4) {
+        frameSize =
+          ((bytes[pos + 4] & 0x7f) << 21) |
+          ((bytes[pos + 5] & 0x7f) << 14) |
+          ((bytes[pos + 6] & 0x7f) << 7) |
+          (bytes[pos + 7] & 0x7f);
+      } else {
+        frameSize =
+          (bytes[pos + 4] << 24) |
+          (bytes[pos + 5] << 16) |
+          (bytes[pos + 6] << 8) |
+          bytes[pos + 7];
+      }
+
+      if (frameSize <= 0 || pos + 10 + frameSize > limit) break;
+
+      const payload = bytes.subarray(pos + 10, pos + 10 + frameSize);
+      if (id === 'TIT2' && !detectedTitle) {
+        detectedTitle = decodeId3TextPayload(payload);
+      } else if (id === 'TPE1' && !detectedArtist) {
+        detectedArtist = decodeId3TextPayload(payload);
+      }
+
+      if (detectedTitle && detectedArtist) break;
+      pos += 10 + frameSize;
+    }
+  }
+
+  // 2. Cek Vorbis Comment (OGG / FLAC): cari pola ASCII "TITLE=" di 64KB pertama
+  if (!detectedTitle) {
+    const scanLen = Math.min(bytes.length, 65536);
+    const headLatin = new TextDecoder('iso-8859-1').decode(bytes.subarray(0, scanLen));
+
+    const vorbisTitleMatch = headLatin.match(/TITLE=([^\x00-\x1f\x7f]{1,120})/i);
+    if (vorbisTitleMatch && vorbisTitleMatch[1]) {
+      try {
+        // Re-decode UTF-8 bytes from the matched slice
+        const idx = headLatin.indexOf(vorbisTitleMatch[0]);
+        if (idx >= 0) {
+          const valStart = idx + 6;
+          // Vorbis comment length is stored in 4 bytes little-endian before "TITLE="
+          if (idx >= 4) {
+            const commentLen =
+              bytes[idx - 4] |
+              (bytes[idx - 3] << 8) |
+              (bytes[idx - 2] << 16) |
+              (bytes[idx - 1] << 24);
+            const valLen = commentLen - 6;
+            if (valLen > 0 && valLen < 200 && valStart + valLen <= bytes.length) {
+              detectedTitle = new TextDecoder('utf-8')
+                .decode(bytes.subarray(valStart, valStart + valLen))
+                .replace(/\0+/g, '')
+                .trim();
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // 3. Cek M4A / MP4 atom "©nam" (0xA9 0x6E 0x61 0x6D)
+    if (!detectedTitle) {
+      for (let i = 0; i < scanLen - 24; i++) {
+        if (
+          bytes[i] === 0xa9 &&
+          bytes[i + 1] === 0x6e &&
+          bytes[i + 2] === 0x61 &&
+          bytes[i + 3] === 0x6d
+        ) {
+          // Cari sub-box 'data' setelah ©nam
+          for (let j = i + 4; j < Math.min(i + 32, scanLen - 16); j++) {
+            if (
+              bytes[j] === 0x64 &&
+              bytes[j + 1] === 0x61 &&
+              bytes[j + 2] === 0x74 &&
+              bytes[j + 3] === 0x61
+            ) {
+              const dataBoxSize =
+                (bytes[j - 4] << 24) |
+                (bytes[j - 3] << 16) |
+                (bytes[j - 2] << 8) |
+                bytes[j - 1];
+              const textStart = j + 12; // 4 ('data') + 4 (type) + 4 (locale)
+              const textEnd = j - 4 + dataBoxSize;
+              if (dataBoxSize > 16 && dataBoxSize < 300 && textEnd <= bytes.length) {
+                detectedTitle = new TextDecoder('utf-8')
+                  .decode(bytes.subarray(textStart, textEnd))
+                  .replace(/\0+/g, '')
+                  .trim();
+                break;
+              }
+            }
+          }
+          if (detectedTitle) break;
+        }
+      }
+    }
+  }
+
+  // Abaikan judul tag generik bawaan encoder
+  const genericTitles = new Set(['track', 'audio_seed', 'suno_track', 'untitled', 'unknown']);
+  if (detectedTitle && !genericTitles.has(detectedTitle.toLowerCase())) {
+    const cleanedTagTitle = cleanTitleFromFileName(detectedTitle);
+    return {
+      title: cleanedTagTitle,
+      artist: detectedArtist || undefined,
+      source: 'tag',
+    };
+  }
+
+  return {
+    title: cleanTitleFromFileName(fileName),
+    artist: detectedArtist || undefined,
+    source: 'filename',
+  };
+}
+
+/**
+ * Menyusun judul final untuk setiap berkas di antrean Remaster.
+ * Jika ada judul yang sama (baik karena mode Auto mendeteksi judul kembar seperti 2 lagu Suno,
+ * maupun karena mode Kustom Judul dipakai pada banyak lagu, atau judul sudah pernah diekspor sebelumnya),
+ * otomatis menambahkan nomor urut di belakangnya (contoh: "Judul Lagu 1", "Judul Lagu 2", dst.).
+ */
+export function resolveUniqueQueueTitles(
+  files: { id: string; name: string; detectedTitle?: string }[],
+  titleMode: 'auto' | 'custom',
+  customTitle: string,
+  previousExportCounts?: Map<string, number>
+): {
+  id: string;
+  baseTitle: string;
+  resolvedTitle: string;
+  isDuplicateNumbered: boolean;
+  sequenceNumber: number;
+}[] {
+  // 1. Tentukan baseTitle untuk setiap file
+  const baseTitles = files.map((file) => {
+    if (titleMode === 'custom' && customTitle.trim().length > 0) {
+      return customTitle.trim();
+    }
+    return (file.detectedTitle && file.detectedTitle.trim()) || cleanTitleFromFileName(file.name);
+  });
+
+  // 2. Hitung total kemunculan masing-masing baseTitle (case-insensitive) di dalam antrean saat ini
+  const batchTotals = new Map<string, number>();
+  for (const bt of baseTitles) {
+    const key = bt.toLowerCase();
+    batchTotals.set(key, (batchTotals.get(key) || 0) + 1);
+  }
+
+  // 3. Lacak urutan berjalan untuk setiap baseTitle
+  const runningCounts = new Map<string, number>();
+
+  return files.map((file, idx) => {
+    const baseTitle = baseTitles[idx];
+    const key = baseTitle.toLowerCase();
+    const totalInBatch = batchTotals.get(key) || 1;
+    const prevExported = previousExportCounts?.get(key) || 0;
+
+    const currentInBatch = (runningCounts.get(key) || 0) + 1;
+    runningCounts.set(key, currentInBatch);
+
+    const sequenceNumber = prevExported + currentInBatch;
+    const needsNumbering = totalInBatch > 1 || prevExported > 0;
+
+    const resolvedTitle = needsNumbering ? `${baseTitle} ${sequenceNumber}` : baseTitle;
+
+    return {
+      id: file.id,
+      baseTitle,
+      resolvedTitle,
+      isDuplicateNumbered: needsNumbering,
+      sequenceNumber,
+    };
+  });
+}
+

@@ -170,6 +170,38 @@ function cleanAudioCache() {
 const cacheCleanerTimer = setInterval(cleanAudioCache, 5 * 60 * 1000);
 cacheCleanerTimer.unref();
 
+function isValidUnencryptedAudioBuffer(buf: Buffer): 'mp3' | 'm4a' | 'wav' | 'ogg' | null {
+  if (!buf || buf.length < 5000) return null;
+
+  // Check M4A / MP4 ('ftyp' at byte offset 4..8)
+  if (buf.subarray(4, 8).toString('ascii') === 'ftyp') {
+    return 'm4a';
+  }
+
+  // Check MP3 ('ID3' header or MPEG frame sync 0xFF 0xE0+)
+  if (
+    buf.subarray(0, 3).toString('ascii') === 'ID3' ||
+    (buf[0] === 0xff && (buf[1] & 0xe0) === 0xe0)
+  ) {
+    return 'mp3';
+  }
+
+  // Check WAV ('RIFF'....'WAVE')
+  if (
+    buf.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    buf.subarray(8, 12).toString('ascii') === 'WAVE'
+  ) {
+    return 'wav';
+  }
+
+  // Check OGG ('OggS')
+  if (buf.subarray(0, 4).toString('ascii') === 'OggS') {
+    return 'ogg';
+  }
+
+  return null;
+}
+
 async function resolveSunoSongId(rawUrl: string): Promise<string> {
   const trimmed = rawUrl.trim();
   // Direct UUID match in the string
@@ -178,14 +210,18 @@ async function resolveSunoSongId(rawUrl: string): Promise<string> {
     if (m) return m[0];
   }
 
+  // Extract clean URL if user pasted share text + URL
+  const urlMatch = trimmed.match(/https?:\/\/[^\s"'<>]+/i);
+  const targetUrl = urlMatch ? urlMatch[0] : trimmed;
+
   // Handle /s/ shortlinks by following redirect
-  if (trimmed.includes('suno.com/s/')) {
+  if (targetUrl.includes('suno.com/s/') || targetUrl.includes('suno.ai/s/')) {
     try {
-      const res = await fetch(trimmed, {
+      const res = await fetch(targetUrl, {
         method: 'GET',
         redirect: 'manual',
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         },
       });
 
@@ -199,13 +235,18 @@ async function resolveSunoSongId(rawUrl: string): Promise<string> {
     }
   }
 
-  // Fallback: fetch page and grep UUID
+  // Fallback: fetch page (following redirects) and check final URL or HTML for UUID
   try {
-    const res = await fetch(trimmed, {
+    const res = await fetch(targetUrl, {
+      redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       },
     });
+    if (res.url) {
+      const urlUuid = res.url.match(UUID_RE);
+      if (urlUuid) return urlUuid[0];
+    }
     const html = await res.text();
     const match = html.match(UUID_RE);
     if (match) return match[0];
@@ -226,10 +267,16 @@ async function fetchSunoMetadata(songId: string) {
   let audioUrl = '';
   let videoUrl = '';
 
+  const isUsableMediaUrl = (u: unknown): u is string =>
+    typeof u === 'string' &&
+    u.startsWith('http') &&
+    !u.includes('/api/forbidden') &&
+    !u.includes('forbidden');
+
   // Primary: Official Suno Studio Clip API
   const apiUrls = [
-    `https://studio-api-prod.suno.com/api/clip/${songId}`,
     `https://studio-api.prod.suno.com/api/clip/${songId}`,
+    `https://studio-api-prod.suno.com/api/clip/${songId}`,
   ];
 
   for (const apiUrl of apiUrls) {
@@ -248,8 +295,8 @@ async function fetchSunoMetadata(songId: string) {
           artist = data.display_name || data.handle || artist;
           imageUrl = data.image_large_url || data.image_url || imageUrl;
           model = data.major_model_version || model;
-          if (data.audio_url) audioUrl = data.audio_url;
-          if (data.video_url) videoUrl = data.video_url;
+          if (isUsableMediaUrl(data.audio_url)) audioUrl = data.audio_url;
+          if (isUsableMediaUrl(data.video_url)) videoUrl = data.video_url;
           if (data.metadata) {
             prompt = data.metadata.prompt || '';
             if (data.metadata.duration && typeof data.metadata.duration === 'number') {
@@ -286,7 +333,7 @@ async function fetchSunoMetadata(songId: string) {
     const pageUrl = `https://suno.com/song/${songId}`;
     const res = await fetch(pageUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       },
     });
     const html = await res.text();
@@ -325,11 +372,13 @@ async function fetchSunoMetadata(songId: string) {
     // Audio/Video URLs in HTML flight data
     const audioUrlMatch = html.match(/\\?"audio_url\\?":\s*\\?"([^"\\]+)\\?"/i) || html.match(/"audio_url":"([^"]+)"/i);
     if (audioUrlMatch) {
-      audioUrl = audioUrlMatch[1].replace(/\\u0026/g, '&');
+      const candidateAudio = audioUrlMatch[1].replace(/\\u0026/g, '&');
+      if (isUsableMediaUrl(candidateAudio)) audioUrl = candidateAudio;
     }
     const videoUrlMatch = html.match(/\\?"video_url\\?":\s*\\?"([^"\\]+)\\?"/i) || html.match(/"video_url":"([^"]+)"/i);
     if (videoUrlMatch) {
-      videoUrl = videoUrlMatch[1].replace(/\\u0026/g, '&');
+      const candidateVideo = videoUrlMatch[1].replace(/\\u0026/g, '&');
+      if (isUsableMediaUrl(candidateVideo)) videoUrl = candidateVideo;
     }
   } catch (err) {
     console.error('Error in fallback Suno scraping:', err);
@@ -351,11 +400,11 @@ async function fetchSunoMetadata(songId: string) {
   return resultMeta;
 }
 
-// Fallback decryptor for DRM-encrypted clips (Mango license protocol)
+// Decryptor for DRM-encrypted clips (Mango license protocol + CloudFront AES-128-CTR stream)
 async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
   const rightsEndpoints = [
-    'https://studio-api-prod.suno.com/api/mango/rights',
     'https://studio-api.prod.suno.com/api/mango/rights',
+    'https://studio-api-prod.suno.com/api/mango/rights',
   ];
 
   let rights: { key: string; iv: string; glt: string } | null = null;
@@ -370,7 +419,7 @@ async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
           Accept: 'application/json',
           Origin: 'https://suno.com',
           Referer: `https://suno.com/song/${songId}`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         },
         body: JSON.stringify({
           content_params: { content_id: songId, content_type: 'clip' },
@@ -457,64 +506,18 @@ async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
   return Buffer.from(decryptedBuf);
 }
 
-// Multi-Source Audio Downloader: Prioritizes direct public CDN streams, with automatic DRM fallback
+// Multi-Source Audio Downloader: Prioritizes DRM Mango Decryption & verified unencrypted CDN streams
 async function fetchSunoAudioStream(songId: string): Promise<{ buffer: Buffer; format: 'mp3' | 'm4a' | 'wav' }> {
-  // 1. Check in-memory cache
+  // 1. Check in-memory cache (verify cached buffer is genuine unencrypted audio)
   const cached = audioStreamCache.get(songId);
-  if (cached && cached.raw) {
+  if (cached && cached.raw && isValidUnencryptedAudioBuffer(cached.raw)) {
     return { buffer: cached.raw, format: cached.rawFormat };
   }
 
-  // 2. Build candidate URLs list
-  const meta = metadataCache.get(songId);
-  const candidates: string[] = [];
-  if (meta?.audioUrl) candidates.push(meta.audioUrl);
-  candidates.push(
-    `https://cdn1.suno.ai/${songId}.mp3`,
-    `https://cdn2.suno.ai/${songId}.mp3`,
-    `https://audiocdn.suno.ai/${songId}.mp3`,
-    `https://cdn.suno.ai/${songId}.mp3`,
-    `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.mp3`,
-    `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.m4a`
-  );
-  if (meta?.videoUrl) candidates.push(meta.videoUrl);
-
-  // Try direct public streaming endpoints
-  for (const url of candidates) {
-    try {
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          Referer: 'https://suno.com/',
-          Accept: '*/*',
-        },
-      });
-
-      if (res.ok) {
-        const ab = await res.arrayBuffer();
-        const buf = Buffer.from(ab);
-        // Ensure not an HTML error response and has meaningful audio data (> 5 KB)
-        if (buf.length > 5000 && !buf.subarray(0, 100).toString().toLowerCase().includes('<!doctype') && !buf.subarray(0, 100).toString().toLowerCase().includes('<html')) {
-          const isM4a = url.includes('.m4a') || url.includes('.mp4');
-          const format: 'mp3' | 'm4a' = isM4a ? 'm4a' : 'mp3';
-          audioStreamCache.set(songId, {
-            raw: buf,
-            rawFormat: format,
-            ...(format === 'mp3' ? { mp3: buf } : { m4a: buf }),
-            timestamp: Date.now(),
-          });
-          return { buffer: buf, format };
-        }
-      }
-    } catch {
-      // Continue to next candidate
-    }
-  }
-
-  // 3. DRM Decryption Fallback
+  // 2. Try Mango DRM Decryption first (Standard for Suno v4/v5/v6 tracks; returns genuine 'ftypisom' M4A AAC)
   try {
     const decryptedM4a = await decryptSunoAudioStream(songId);
-    if (decryptedM4a && decryptedM4a.length > 5000) {
+    if (decryptedM4a && isValidUnencryptedAudioBuffer(decryptedM4a)) {
       audioStreamCache.set(songId, {
         raw: decryptedM4a,
         rawFormat: 'm4a',
@@ -524,7 +527,54 @@ async function fetchSunoAudioStream(songId: string): Promise<{ buffer: Buffer; f
       return { buffer: decryptedM4a, format: 'm4a' };
     }
   } catch (err: any) {
-    console.warn(`DRM fallback attempt for ${songId}:`, err?.message);
+    console.warn(`Mango DRM decryption notice for ${songId}:`, err?.message);
+  }
+
+  // 3. Fallback: Try direct public CDN endpoints (for older v3/v3.5 tracks) with strict magic-byte verification
+  // NEVER include d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.m4a here because that stream is AES-CTR encrypted!
+  const meta = metadataCache.get(songId);
+  const candidates: string[] = [];
+  if (meta?.audioUrl && !meta.audioUrl.includes('forbidden')) {
+    candidates.push(meta.audioUrl);
+  }
+  candidates.push(
+    `https://cdn1.suno.ai/${songId}.mp3`,
+    `https://cdn2.suno.ai/${songId}.mp3`,
+    `https://audiocdn.suno.ai/${songId}.mp3`,
+    `https://cdn.suno.ai/${songId}.mp3`
+  );
+  if (meta?.videoUrl && !meta.videoUrl.includes('forbidden')) {
+    candidates.push(meta.videoUrl);
+  }
+
+  for (const url of candidates) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Referer: 'https://suno.com/',
+          Accept: '*/*',
+        },
+      });
+
+      if (res.ok) {
+        const ab = await res.arrayBuffer();
+        const buf = Buffer.from(ab);
+        const detectedFormat = isValidUnencryptedAudioBuffer(buf);
+        if (detectedFormat) {
+          const format: 'mp3' | 'm4a' | 'wav' = detectedFormat === 'm4a' ? 'm4a' : detectedFormat === 'wav' ? 'wav' : 'mp3';
+          audioStreamCache.set(songId, {
+            raw: buf,
+            rawFormat: format,
+            ...(format === 'mp3' ? { mp3: buf } : format === 'm4a' ? { m4a: buf } : {}),
+            timestamp: Date.now(),
+          });
+          return { buffer: buf, format };
+        }
+      }
+    } catch {
+      // Continue to next candidate
+    }
   }
 
   throw new Error(`Tidak dapat mengunduh berkas audio dari CDN Suno untuk ID "${songId}". Pastikan lagu ini publik atau coba tautan lagu Suno lainnya.`);
@@ -705,8 +755,8 @@ app.post('/api/audio/encode-ogg', express.raw({ type: ['audio/*', 'application/o
 // ==========================================
 // AUDIO ARMOR ENGINE — CoSuProcessor Reference Implementation
 // ==========================================
-export type CanonicalArmorPreset = 'vocal_armor' | 'pulse_armor' | 'warm_armor';
-export type CoSuPresetKey = 'original' | 'staccato' | 'slow_tempo';
+export type CanonicalArmorPreset = 'vocal_armor' | 'pulse_armor' | 'warm_armor' | 'tempo_armor';
+export type CoSuPresetKey = 'original' | 'staccato' | 'slow_tempo' | 'tempo_flex';
 export type ArmorFormatType = 'wav' | 'ogg' | 'mp3';
 
 interface ArmorOptions {
@@ -716,6 +766,7 @@ interface ArmorOptions {
   duration: number;
   title?: string;
   format?: ArmorFormatType;
+  tempoShift?: number;
 }
 
 export interface AudioMetadataInfo {
@@ -733,9 +784,16 @@ function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalAr
   if (!rawPreset) return 'vocal_armor';
   const p = String(rawPreset).toLowerCase().trim();
   if (
+    p === 'tempo_armor' ||
+    p === 'tempo_flex' ||
+    p === 'slowest' ||
+    p === 'slowest_tempo' ||
+    p === 'custom_tempo'
+  ) {
+    return 'tempo_armor';
+  }
+  if (
     p === 'pulse_armor' ||
-    p === 'staccato' ||
-    p === 'staccato_guide' ||
     p === 'pulse' ||
     p === 'rhythmic_chop'
   ) {
@@ -743,6 +801,8 @@ function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalAr
   }
   if (
     p === 'warm_armor' ||
+    p === 'staccato' ||
+    p === 'staccato_guide' ||
     p === 'slow_tempo' ||
     p === 'slow_ballad' ||
     p === 'ballad' ||
@@ -756,8 +816,9 @@ function normalizeArmorPreset(rawPreset: string | undefined | null): CanonicalAr
 
 function toCoSuPresetKey(rawPreset: string | undefined | null): CoSuPresetKey {
   const canonical = normalizeArmorPreset(rawPreset);
-  if (canonical === 'warm_armor') return 'slow_tempo';
-  if (canonical === 'pulse_armor') return 'staccato';
+  if (canonical === 'tempo_armor') return 'tempo_flex';
+  if (canonical === 'warm_armor') return 'staccato';
+  if (canonical === 'pulse_armor') return 'slow_tempo';
   return 'original';
 }
 
@@ -948,13 +1009,31 @@ class CoSuProcessor {
    * Menggunakan formula native core FFmpeg (aresample pre-normalization + asetrate + aformat + atempo)
    * Menjamin presisi matematis 100% pada file 44.1k, 48k (Suno v3.5/v4), dan 96k tanpa drift tempo / pitch.
    */
-  getDspFilter(preset: string = 'original'): string {
+  getDspFilter(preset: string = 'original', tempoShiftPercent: number = -12): string {
     const p = (preset || 'original').toLowerCase().trim();
     const pitchShiftCore =
       'aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=1.122462';
     // 16-bit triangular dither + 0.95 limiter matches manual converter output (audio_sukses) while keeping 100% symmetric phase cancellation
     const postConditioner =
       'alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16';
+
+    if (
+      p === 'tempo_armor' ||
+      p === 'tempo_flex' ||
+      p === 'slowest' ||
+      p === 'slowest_tempo' ||
+      p === 'custom_tempo'
+    ) {
+      // ⏱️ Tempo Armor (Vocal-Forward 42%..22% Continuous Guide + 150Hz Warm Body + Vocal Presence EQ + Flexible Tempo Shift)
+      const clampedShift = Math.max(
+        -30,
+        Math.min(30, Number.isFinite(tempoShiftPercent) ? tempoShiftPercent : -12)
+      );
+      const tempoMultiplier = 1 + clampedShift / 100;
+      const atempoVal = Math.max(0.5, Math.min(2.0, 1.122462 * tempoMultiplier)).toFixed(6);
+      const flexPitchTempoCore = `aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=${atempoVal}`;
+      return `aeval=exprs='val(0)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(1)|val(1)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(0)':c=stereo,highpass=f=150,equalizer=f=1350:t=q:w=1.1:g=2.8,equalizer=f=2600:t=q:w=1.0:g=4.2,${flexPitchTempoCore},volume=1.75,${postConditioner}`;
+    }
 
     if (p === 'pulse_armor' || p === 'pulse' || p === 'rhythmic_chop' || p === 'slow_tempo') {
       // ⚡ Pulse Armor (5.5Hz Tremolo Pulse + Bass +3dB + Notch 1800Hz + Transpose -2st + Tempo +5%)
@@ -984,7 +1063,9 @@ class CoSuProcessor {
 
     const canonical = normalizeArmorPreset(options.preset);
     const presetSuffix =
-      canonical === 'warm_armor'
+      canonical === 'tempo_armor'
+        ? '_TempoArmor'
+        : canonical === 'warm_armor'
         ? '_WarmArmor'
         : canonical === 'pulse_armor'
         ? '_PulseArmor'
@@ -1044,6 +1125,7 @@ class CoSuProcessor {
       preset?: string;
       format?: ArmorFormatType;
       title?: string;
+      tempoShift?: number;
     } = {},
     onProgress?: ((info: { stage: string; message: string }) => void) | null
   ) {
@@ -1051,6 +1133,7 @@ class CoSuProcessor {
     const startTime = Math.max(0, parseFloat(String(options.startTime || 0)));
     const duration = parseFloat(String(options.duration || 60.0));
     const canonicalPreset = normalizeArmorPreset(options.preset || 'original');
+    const tempoShift = options.tempoShift !== undefined ? Number(options.tempoShift) : -12;
     const format: ArmorFormatType =
       options.format === 'wav' ? 'wav' : options.format === 'ogg' ? 'ogg' : 'mp3';
     const outputPath =
@@ -1068,9 +1151,11 @@ class CoSuProcessor {
       fs.mkdirSync(outputDir, { recursive: true });
     }
 
-    const dspFilter = this.getDspFilter(canonicalPreset);
+    const dspFilter = this.getDspFilter(canonicalPreset, tempoShift);
     const modeLabel =
-      canonicalPreset === 'warm_armor'
+      canonicalPreset === 'tempo_armor'
+        ? 'Tempo Armor'
+        : canonicalPreset === 'warm_armor'
         ? 'Warm Armor'
         : canonicalPreset === 'pulse_armor'
         ? 'Pulse Armor'
@@ -1303,6 +1388,7 @@ async function runArmorFFmpeg(
       preset,
       format,
       title: options.title,
+      tempoShift: options.tempoShift,
     });
 
     const resultBuffer = await fs.promises.readFile(tempOutput);
@@ -1415,6 +1501,13 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
     const format: ArmorFormatType =
       rawFormat === 'wav' ? 'wav' : rawFormat === 'ogg' ? 'ogg' : 'mp3';
 
+    const rawTempoShift = parseFloat(
+      (req.query.tempoShift as string) ||
+        (req.headers['x-armor-tempo-shift'] as string) ||
+        '-12'
+    );
+    const tempoShift = Number.isFinite(rawTempoShift) ? rawTempoShift : -12;
+
     const result = await runArmorFFmpeg(audioBuffer, {
       preset,
       mode,
@@ -1422,6 +1515,7 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
       duration,
       title,
       format,
+      tempoShift,
     });
 
     const safeAsciiFilename = (result.filename || 'Armor_Audio.mp3').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
@@ -1511,6 +1605,11 @@ app.post('/api/suno/parse', async (req, res) => {
     const songId = await resolveSunoSongId(url);
     const metadata = await fetchSunoMetadata(songId);
 
+    // Pre-decrypt and cache the audio stream in the background so preview & downloads are instant
+    fetchSunoAudioStream(songId).catch((err) => {
+      console.warn('Pre-warm audio stream warning:', err?.message);
+    });
+
     res.json({
       success: true,
       metadata,
@@ -1528,6 +1627,7 @@ app.get('/api/suno/download', async (req, res) => {
   try {
     const songId = (req.query.id as string) || '';
     const format = ((req.query.format as string) || 'mp3').toLowerCase() as 'mp3' | 'm4a' | 'ogg';
+    const isInline = req.query.inline === '1' || req.query.inline === 'true';
     const rawTitle = (req.query.title as string) || 'Suno_Track';
     const cleanTitle = rawTitle.replace(/[^a-zA-Z0-9_\-]/g, '_');
 
@@ -1587,7 +1687,10 @@ app.get('/api/suno/download', async (req, res) => {
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
-    res.setHeader('Content-Disposition', `attachment; filename="${cleanTitle}.${fileExt}"`);
+    res.setHeader(
+      'Content-Disposition',
+      `${isInline ? 'inline' : 'attachment'}; filename="${cleanTitle}.${fileExt}"`
+    );
 
     if (range) {
       const parts = range.replace(/bytes=/, '').split('-');

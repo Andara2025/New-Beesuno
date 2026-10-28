@@ -6,15 +6,15 @@
  * 3. Slow Tempo Shield (warm_armor / slow_tempo)   -> _SlowTempo
  */
 
-export type CanonicalArmorPresetId = 'vocal_armor' | 'pulse_armor' | 'warm_armor';
+export type CanonicalArmorPresetId = 'vocal_armor' | 'pulse_armor' | 'warm_armor' | 'tempo_armor';
 
 export interface ArmorPresetMeta {
   id: CanonicalArmorPresetId;
-  cosuKey: 'original' | 'staccato' | 'slow_tempo';
+  cosuKey: 'original' | 'staccato' | 'slow_tempo' | 'tempo_flex';
   order: number;
   name: string;
   badge: string;
-  accent: 'emerald' | 'amber' | 'violet';
+  accent: 'emerald' | 'amber' | 'violet' | 'sky';
   icon: string;
   desc: string;
   bestFor: string[];
@@ -35,7 +35,8 @@ export const ARMOR_CONSTANTS = {
   TEMPO_VOCAL: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch -2st, tempo restored)
   TEMPO_RESTORE: 1.122462,
   TEMPO_PULSE: 1.122462, // 0.8908987 * 1.122462 = 1.000x net tempo (pitch -2st, tempo restored)
-  TEMPO_WARM: 1.178585, // 0.8908987 * 1.178585 = 1.050x net tempo (+5% speed untuk Slow Tempo Shield)
+  TEMPO_WARM: 1.178585, // 0.8908987 * 1.178585 = 1.050x net tempo (+5% speed)
+  TEMPO_SLOWEST_DEFAULT: -12, // Default -12% (0.88x net tempo)
   SAMPLE_RATE: 44100,
 } as const;
 
@@ -101,6 +102,25 @@ export const ARMOR_PRESETS: Record<CanonicalArmorPresetId, ArmorPresetMeta> = {
     tone: 'Karakter hangat, lembut, dengan panduan nada vokal',
     ffmpegFilter: `aeval=exprs='val(0)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(1)|val(1)-if(lt(mod(t\\,3.0)\\,1.35)\\,0.78\\,if(lt(mod(t\\,3.0)\\,1.40)\\,0.78+0.22*(mod(t\\,3.0)-1.35)/0.05\\,if(gt(mod(t\\,3.0)\\,2.95)\\,1.0-0.22*(mod(t\\,3.0)-2.95)/0.05\\,1.0)))*val(0)':c=stereo,highpass=f=250,${PITCH_SHIFT_CORE},volume=1.6,alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16`,
   },
+  tempo_armor: {
+    id: 'tempo_armor',
+    cosuKey: 'tempo_flex',
+    order: 4,
+    name: 'Tempo Armor',
+    badge: 'VOKAL JELAS + TEMPO',
+    accent: 'sky',
+    icon: '⏱️',
+    desc: 'Vokal lebih jelas, tebal, dan menonjol di depan dengan pengatur tempo fleksibel (Default -12% Slowest). Bisa di-slowdown atau speed-up sesuai lagu.',
+    bestFor: ['Vokal Menonjol', 'Slowdown -12%', 'Speed Up', 'Semua Lagu'],
+    suffix: '_TempoArmor',
+    aliases: ['tempo_armor', 'tempo_flex', 'slowest', 'slowest_tempo', 'custom_tempo'],
+    stereoBehavior: 'Vokal Menonjol + Kontur Tempo Fleksibel',
+    monoDownmix: 'Seimbang & Aman Verifikasi',
+    tempo: 'Fleksibel (Default -12%)',
+    lowCutHz: 150,
+    tone: 'Vokal jelas di depan, hangat, dengan kecepatan tempo fleksibel',
+    ffmpegFilter: `aeval=exprs='val(0)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(1)|val(1)-if(lt(mod(t\\,2.8)\\,1.75)\\,0.58\\,if(lt(mod(t\\,2.8)\\,1.80)\\,0.58+0.20*(mod(t\\,2.8)-1.75)/0.05\\,if(gt(mod(t\\,2.8)\\,2.75)\\,0.78-0.20*(mod(t\\,2.8)-2.75)/0.05\\,0.78)))*val(0)':c=stereo,highpass=f=150,equalizer=f=1350:t=q:w=1.1:g=2.8,equalizer=f=2600:t=q:w=1.0:g=4.2,aformat=channel_layouts=stereo,aresample=44100,asetrate=44100*0.8908987,aresample=44100,atempo=0.987767,volume=1.75,alimiter=limit=0.95:level=disabled:attack=5:release=50,aresample=44100:dither_method=triangular,aformat=sample_fmts=s16`,
+  },
 };
 
 export const DEFAULT_ARMOR_PRESET: CanonicalArmorPresetId = 'vocal_armor';
@@ -165,7 +185,7 @@ export function buildArmorOutputFilename(
 }
 
 /**
- * Evaluates the Staccato Guide pulse modulation cancellation factor k(t) at time t (in seconds)
+ * Evaluates the Warm Armor pulse modulation cancellation factor k(t) at time t (in seconds)
  * Exact match for FFmpeg aeval expression:
  * if(lt(mod(t,3.0),1.35), 0.78,
  *   if(lt(mod(t,3.0),1.40), 0.78+0.22*(mod(t,3.0)-1.35)/0.05,
@@ -183,4 +203,26 @@ export function getPulseArmorK(t: number): number {
     return 1.0 - (0.22 * (modT - 2.95)) / 0.05;
   }
   return 1.0;
+}
+
+/**
+ * Evaluates the Tempo Armor vocal-forward cancellation factor k(t) at time t (in seconds).
+ * Keeps lead vocal continuously audible (42% vocal for 1.75s, smoothly dipping to 22% vocal for 0.95s, never muting to 0%).
+ * Exact match for FFmpeg aeval expression:
+ * if(lt(mod(t,2.8),1.75), 0.58,
+ *   if(lt(mod(t,2.8),1.80), 0.58+0.20*(mod(t,2.8)-1.75)/0.05,
+ *     if(gt(mod(t,2.8),2.75), 0.78-0.20*(mod(t,2.8)-2.75)/0.05, 0.78)))
+ */
+export function getTempoArmorK(t: number): number {
+  const modT = ((t % 2.8) + 2.8) % 2.8;
+  if (modT < 1.75) {
+    return 0.58;
+  }
+  if (modT < 1.80) {
+    return 0.58 + (0.20 * (modT - 1.75)) / 0.05;
+  }
+  if (modT > 2.75) {
+    return 0.78 - (0.20 * (modT - 2.75)) / 0.05;
+  }
+  return 0.78;
 }

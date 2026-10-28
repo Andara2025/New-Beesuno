@@ -63,6 +63,7 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
 
     setLoading(true);
     setError(null);
+    setAudioError(null);
     if (audioRef.current) {
       audioRef.current.pause();
       setIsPlaying(false);
@@ -81,7 +82,8 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
       }
 
       setMetadata(data.metadata);
-      setAudioUrl(`/api/suno/download?id=${data.metadata.songId}&format=mp3&title=${encodeURIComponent(data.metadata.title)}`);
+      // Gunakan format=m4a&inline=1 untuk preview instan tanpa jeda transcoding
+      setAudioUrl(`/api/suno/download?id=${data.metadata.songId}&format=m4a&inline=1&title=${encodeURIComponent(data.metadata.title)}`);
     } catch (err: any) {
       setError(err.message || 'Terjadi kesalahan saat memproses tautan.');
     } finally {
@@ -288,10 +290,20 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
                         ref={audioRef}
                         src={audioUrl}
                         preload="metadata"
-                        onPlay={() => setIsPlaying(true)}
+                        onCanPlay={() => setAudioError(null)}
+                        onPlay={() => {
+                          setIsPlaying(true);
+                          setAudioError(null);
+                        }}
                         onPause={() => setIsPlaying(false)}
                         onEnded={() => setIsPlaying(false)}
-                        onError={() => setAudioError('Gagal memutar preview audio.')}
+                        onError={() => {
+                          if (audioUrl && audioUrl.includes('format=m4a') && metadata) {
+                            setAudioUrl(`/api/suno/download?id=${metadata.songId}&format=mp3&inline=1&title=${encodeURIComponent(metadata.title)}`);
+                          } else {
+                            setAudioError('Gagal memutar preview audio.');
+                          }
+                        }}
                         className="w-full h-7"
                         controls
                       />

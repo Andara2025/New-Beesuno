@@ -91,7 +91,8 @@ function writeString(view: DataView, offset: number, string: string) {
 export async function encodeMp3(
   audioBuffer: AudioBuffer,
   metadata: MetadataSettings,
-  fileName: string
+  fileName: string,
+  resolvedTitleOverride?: string
 ): Promise<Blob> {
   const numChannels = Math.min(2, audioBuffer.numberOfChannels);
   const sampleRate = audioBuffer.sampleRate;
@@ -154,7 +155,9 @@ export async function encodeMp3(
   }
 
   // Synthesize ID3v2 tag with zero C2PA references
-  const title = metadata.titleMode === 'custom' && metadata.customTitle
+  const title = resolvedTitleOverride && resolvedTitleOverride.trim().length > 0
+    ? resolvedTitleOverride.trim()
+    : metadata.titleMode === 'custom' && metadata.customTitle
     ? metadata.customTitle
     : fileName.replace(/\.[^/.]+$/, '');
 
@@ -183,7 +186,8 @@ export async function encodeMp3(
 export async function encodeOgg(
   audioBuffer: AudioBuffer,
   metadata: MetadataSettings,
-  fileName: string
+  fileName: string,
+  resolvedTitleOverride?: string
 ): Promise<Blob> {
   // Step 1: Render PCM WAV 16-bit in memory
   const wavBlob = encodeWav(audioBuffer, 16);
@@ -209,7 +213,7 @@ export async function encodeOgg(
   }
 
   // Fallback: If server is unavailable, fallback to MP3
-  return encodeMp3(audioBuffer, metadata, fileName);
+  return encodeMp3(audioBuffer, metadata, fileName, resolvedTitleOverride);
 }
 
 /**
@@ -219,11 +223,12 @@ export async function exportMasterFile(
   renderedBuffer: AudioBuffer,
   format: AudioFormat,
   metadata: MetadataSettings,
-  fileName: string
+  fileName: string,
+  resolvedTitleOverride?: string
 ): Promise<{ blob: Blob; ext: string }> {
   switch (format) {
     case 'ogg': {
-      const oggBlob = await encodeOgg(renderedBuffer, metadata, fileName);
+      const oggBlob = await encodeOgg(renderedBuffer, metadata, fileName, resolvedTitleOverride);
       return {
         blob: oggBlob,
         ext: 'ogg',
@@ -253,7 +258,7 @@ export async function exportMasterFile(
       };
     case 'mp3':
     default: {
-      const mp3Blob = await encodeMp3(renderedBuffer, metadata, fileName);
+      const mp3Blob = await encodeMp3(renderedBuffer, metadata, fileName, resolvedTitleOverride);
       return {
         blob: mp3Blob,
         ext: 'mp3',

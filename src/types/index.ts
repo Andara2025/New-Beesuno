@@ -39,6 +39,11 @@ export interface AudioFileItem {
   id: string;
   file: File;
   name: string;
+  detectedTitle?: string;
+  titleSource?: 'tag' | 'filename';
+  detectedArtist?: string;
+  resolvedTitle?: string;
+  resultFileName?: string;
   size: number;
   duration: number;
   sampleRate: number;
@@ -59,7 +64,7 @@ export interface AudioEngineStats {
   acousticCloakerStatus: string;
 }
 
-export type CanonicalArmorPresetId = 'vocal_armor' | 'pulse_armor' | 'warm_armor';
+export type CanonicalArmorPresetId = 'vocal_armor' | 'pulse_armor' | 'warm_armor' | 'tempo_armor';
 export type ArmorFormat = 'mp3' | 'wav' | 'ogg';
 
 export interface ArmorPresetInfo {
@@ -67,7 +72,7 @@ export interface ArmorPresetInfo {
   order: number;
   name: string;
   badge: string;
-  accent: 'emerald' | 'amber' | 'violet';
+  accent: 'emerald' | 'amber' | 'violet' | 'sky';
   icon: string;
   desc: string;
   bestFor: string[];
