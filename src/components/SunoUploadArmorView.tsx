@@ -19,7 +19,9 @@ import {
   Scissors,
   Volume2,
   Radio,
-  FileAudio
+  FileAudio,
+  Link2,
+  Loader2
 } from 'lucide-react';
 import { getAudioContext, generateSampleSunoAudio } from '../utils/audioEngine';
 import { encodeWav, encodeMp3 } from '../utils/audioEncoder';
@@ -53,9 +55,13 @@ export type ArmorFormatType = 'wav' | 'ogg' | 'mp3';
 
 export interface SunoUploadArmorViewProps {
   onNavigateTab?: (tab: 'cloaker' | 'armor' | 'downloader' | 'remaster') => void;
+  externalAudioFile?: File | null;
 }
 
-export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavigateTab }) => {
+export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({
+  onNavigateTab,
+  externalAudioFile,
+}) => {
   // Preset & Processing Options
   const [selectedPreset, setSelectedPreset] = useState<CanonicalArmorPresetId>(DEFAULT_ARMOR_PRESET);
   const [tempoShiftPercent, setTempoShiftPercent] = useState<number>(ARMOR_CONSTANTS.TEMPO_SLOWEST_DEFAULT);
@@ -73,6 +79,16 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   const [fileSize, setFileSize] = useState<number>(1450000);
   const [audioDuration, setAudioDuration] = useState<number>(60);
 
+  // Suno Share Link Direct Import State
+  const [shareLinkInput, setShareLinkInput] = useState<string>('');
+  const [shareLinkLoading, setShareLinkLoading] = useState<boolean>(false);
+  const [importedSunoSong, setImportedSunoSong] = useState<{
+    songId: string;
+    title: string;
+    artist: string;
+    directDownloadUrl: string;
+  } | null>(null);
+
   // Microphone Recording State
   const [isRecording, setIsRecording] = useState<boolean>(false);
   const [recordingSeconds, setRecordingSeconds] = useState<number>(0);
@@ -89,6 +105,7 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [resultBlob, setResultBlob] = useState<Blob | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
+  const [serverDownloadUrl, setServerDownloadUrl] = useState<string | null>(null);
   const [downloadFilename, setDownloadFilename] = useState<string>('');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
@@ -676,15 +693,14 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
     }
   };
 
-  // Handle File Upload
-  const handleFileUpload = async (files: FileList | null) => {
-    if (!files || files.length === 0) return;
-    const file = files[0];
+  // Load single File into Armor Studio
+  const loadSingleAudioFile = async (file: File) => {
     setRawFile(file);
     setFileName(file.name);
     setFileSize(file.size);
     setResultBlob(null);
     setResultUrl(null);
+    setServerDownloadUrl(null);
     setErrorMessage(null);
 
     stopLocalPlayback();
@@ -699,6 +715,69 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       setCurrentTime(0);
     } catch (err) {
       console.error('Error decoding audio:', err);
+    }
+  };
+
+  // Load external file when sent from Suno Downloader tab
+  useEffect(() => {
+    if (externalAudioFile) {
+      loadSingleAudioFile(externalAudioFile);
+    }
+  }, [externalAudioFile]);
+
+  // Handle File Upload
+  const handleFileUpload = async (files: FileList | null) => {
+    if (!files || files.length === 0) return;
+    setImportedSunoSong(null);
+    await loadSingleAudioFile(files[0]);
+  };
+
+  // Handle Direct Import & Download from Suno Share Link (e.g. https://suno.com/s/...)
+  const handleImportFromShareLink = async (customUrl?: string) => {
+    const targetUrl = (customUrl ?? shareLinkInput).trim();
+    if (!targetUrl) {
+      setErrorMessage('Tempel tautan share Suno terlebih dahulu (contoh: https://suno.com/s/...).');
+      return;
+    }
+
+    setShareLinkLoading(true);
+    setErrorMessage(null);
+    stopLocalPlayback();
+
+    try {
+      const parseRes = await fetch('/api/suno/parse', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: targetUrl }),
+      });
+      const parseData = await parseRes.json();
+      if (!parseRes.ok || !parseData.success || !parseData.metadata) {
+        throw new Error(parseData.error || 'Gagal membaca tautan share Suno.');
+      }
+
+      const meta = parseData.metadata;
+      const cleanTitle = (meta.title || 'Suno_Track').replace(/[\\/:*?"<>|]/g, '_');
+      const directUrl = `/api/suno/download?id=${encodeURIComponent(meta.songId)}&format=mp3&title=${encodeURIComponent(cleanTitle)}`;
+
+      const audioRes = await fetch(directUrl);
+      if (!audioRes.ok) {
+        const errText = await audioRes.text();
+        throw new Error(errText || 'Gagal mengunduh audio dari tautan share Suno.');
+      }
+
+      const audioBlob = await audioRes.blob();
+      const importedFile = new File([audioBlob], `${cleanTitle}.mp3`, { type: 'audio/mpeg' });
+      setImportedSunoSong({
+        songId: meta.songId,
+        title: meta.title || cleanTitle,
+        artist: meta.artist || 'Suno Creator',
+        directDownloadUrl: directUrl,
+      });
+      await loadSingleAudioFile(importedFile);
+    } catch (err: any) {
+      setErrorMessage(err?.message || 'Gagal mengambil audio dari link share Suno.');
+    } finally {
+      setShareLinkLoading(false);
     }
   };
 
@@ -1036,6 +1115,8 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       let blob: Blob | null = null;
       let returnedFilename = defaultFilename;
 
+      let finalServerUrl: string | null = null;
+
       // Phase 1: Try server processing with safety timeout
       try {
         const payloadBlob = await getAudioPayload();
@@ -1070,6 +1151,11 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
           if (response.ok) {
             blob = await response.blob();
             returnedFilename = response.headers.get('X-Armor-Filename') || defaultFilename;
+            const dlId = response.headers.get('X-Armor-Download-Id');
+            if (dlId) {
+              finalServerUrl = `/api/audio/download/${encodeURIComponent(dlId)}?filename=${encodeURIComponent(returnedFilename)}`;
+              setServerDownloadUrl(finalServerUrl);
+            }
           } else {
             const errJson = await response.json().catch(() => null);
             if (errJson && errJson.error) {
@@ -1161,6 +1247,25 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
           blob = encodeWav(renderedBuffer, 16);
           returnedFilename = defaultFilename;
         }
+
+        // Cache client-rendered blob on server so iframe/share link gets a native HTTP GET attachment URL
+        try {
+          const cacheRes = await fetch(
+            `/api/audio/cache-download?filename=${encodeURIComponent(returnedFilename)}&contentType=${encodeURIComponent(blob.type || 'audio/mpeg')}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: blob,
+            }
+          );
+          if (cacheRes.ok) {
+            const cacheData = await cacheRes.json();
+            if (cacheData?.downloadUrl) {
+              finalServerUrl = cacheData.downloadUrl;
+              setServerDownloadUrl(cacheData.downloadUrl);
+            }
+          }
+        } catch (_) {}
       }
 
       const downloadUrl = URL.createObjectURL(blob);
@@ -1168,9 +1273,9 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
       setResultUrl(downloadUrl);
       setDownloadFilename(returnedFilename);
 
-      // Auto trigger download
+      // Auto trigger download (prefer server attachment URL if available for iframe compatibility)
       const a = document.createElement('a');
-      a.href = downloadUrl;
+      a.href = finalServerUrl || downloadUrl;
       a.download = returnedFilename;
       document.body.appendChild(a);
       a.click();
@@ -1317,6 +1422,59 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
                   <Mic className="w-4 h-4 text-zinc-300" />
                   <span>Rekam Mic</span>
                 </button>
+              </div>
+            </div>
+
+            {/* Direct Suno Share Link Importer & Downloader Bar */}
+            <div className="mt-4 pt-4 border-t border-white/[0.06] flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+              <div className="relative flex-1">
+                <Link2 className="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <input
+                  type="text"
+                  value={shareLinkInput}
+                  onChange={(e) => setShareLinkInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleImportFromShareLink();
+                    }
+                  }}
+                  placeholder="Atau tempel Link Share Suno (contoh: https://suno.com/s/thfpbMQ7o3ZldFiM) lalu klik Ambil..."
+                  className="w-full bg-black/30 border border-white/[0.1] rounded-xl pl-10 pr-3 py-2 text-xs text-zinc-200 placeholder:text-zinc-500 focus:outline-none focus:border-white/30 font-mono transition"
+                />
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => handleImportFromShareLink()}
+                  disabled={shareLinkLoading}
+                  className="flex-1 sm:flex-initial bg-[#2c2e38] hover:bg-[#363845] disabled:opacity-50 text-white border border-white/15 px-4 py-2 rounded-xl text-xs font-medium flex items-center justify-center gap-1.5 transition active:scale-95"
+                >
+                  {shareLinkLoading ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin text-white" />
+                      <span>Mengunduh...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+                      <span>Ambil dari Link Share</span>
+                    </>
+                  )}
+                </button>
+
+                {importedSunoSong && (
+                  <a
+                    href={importedSunoSong.directDownloadUrl}
+                    download={`${importedSunoSong.title}.mp3`}
+                    className="bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shrink-0"
+                    title="Unduh MP3 asli hasil dekripsi dari link share Suno"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>Unduh MP3 Asli</span>
+                  </a>
+                )}
               </div>
             </div>
           </div>
@@ -2004,18 +2162,19 @@ export const SunoUploadArmorView: React.FC<SunoUploadArmorViewProps> = ({ onNavi
               </span>
             </button>
 
-            {resultUrl && (
-              <div className="p-3 bg-white/[0.04] border border-white/[0.08] rounded-xl flex items-center justify-between gap-2 text-xs">
-                <div className="flex items-center gap-2 text-zinc-200 font-medium truncate">
+            {(serverDownloadUrl || resultUrl) && (
+              <div className="p-3.5 bg-emerald-500/10 border border-emerald-500/30 rounded-xl flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs">
+                <div className="flex items-center gap-2 text-zinc-100 font-medium truncate">
                   <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
                   <span className="truncate">{downloadFilename}</span>
                 </div>
                 <a
-                  href={resultUrl}
+                  href={serverDownloadUrl || resultUrl || '#'}
                   download={downloadFilename}
-                  className="bg-white text-black px-3 py-1 rounded-lg font-semibold text-[11px] hover:bg-zinc-200 transition shrink-0"
+                  className="bg-emerald-400 hover:bg-emerald-300 text-black px-3.5 py-1.5 rounded-lg font-semibold text-xs transition shrink-0 flex items-center justify-center gap-1.5 shadow-sm"
                 >
-                  Unduh Ulang
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Unduh File Sekarang</span>
                 </a>
               </div>
             )}

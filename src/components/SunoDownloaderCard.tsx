@@ -59,38 +59,25 @@ export const SunoDownloaderCard: React.FC<SunoDownloaderCardProps> = ({ onImport
     }
   };
 
-  const handleDownload = async (format: 'mp3' | 'm4a' | 'ogg') => {
-    if (!metadata) return;
+  const getDirectDownloadUrl = (songId: string, format: 'mp3' | 'm4a' | 'ogg', title: string) => {
+    const cleanTitle = (title || 'Suno_Track').replace(/[\\/:*?"<>|]/g, '_');
+    return `/api/suno/download?id=${encodeURIComponent(songId)}&format=${format}&title=${encodeURIComponent(cleanTitle)}`;
+  };
+
+  const handleDownload = () => {
     setError(null);
     setDownloading(true);
-    try {
-      const url = `/api/suno/download?id=${metadata.songId}&format=${format}&title=${encodeURIComponent(metadata.title)}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(errorText || `Gagal mengunduh audio (${res.status})`);
-      }
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = `${metadata.title}.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
-    } catch (err: any) {
-      setError(err.message || 'Gagal mengunduh audio Suno.');
-    } finally {
+    window.setTimeout(() => {
       setDownloading(false);
-    }
+    }, 1800);
   };
 
   const handleImportDirect = async () => {
     if (!metadata || !onImportToRemaster) return;
     setDownloading(true);
+    setError(null);
     try {
-      const url = `/api/suno/download?id=${metadata.songId}&format=mp3&title=${encodeURIComponent(metadata.title)}`;
+      const url = getDirectDownloadUrl(metadata.songId, 'mp3', metadata.title);
       const res = await fetch(url);
       if (!res.ok) throw new Error('Gagal mengunduh berkas audio.');
       const blob = await res.blob();
@@ -207,24 +194,29 @@ export const SunoDownloaderCard: React.FC<SunoDownloaderCardProps> = ({ onImport
             </div>
 
             <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
-              <button
-                onClick={() => handleDownload('mp3')}
+              <a
+                href={getDirectDownloadUrl(metadata.songId, 'mp3', metadata.title)}
+                download={`${metadata.title}.mp3`}
+                onClick={handleDownload}
                 className="flex-1 sm:flex-none bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3 py-1.5 rounded-xl text-xs font-medium flex items-center justify-center gap-1.5 transition"
               >
                 <Download className="w-3.5 h-3.5" />
                 <span>Unduh MP3</span>
-              </button>
+              </a>
 
-              <button
-                onClick={() => handleDownload('ogg')}
+              <a
+                href={getDirectDownloadUrl(metadata.songId, 'ogg', metadata.title)}
+                download={`${metadata.title}.ogg`}
+                onClick={handleDownload}
                 className="flex-1 sm:flex-none bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3 py-1.5 rounded-xl text-xs font-medium flex items-center justify-center gap-1.5 transition"
               >
                 <Download className="w-3.5 h-3.5" />
                 <span>OGG</span>
-              </button>
+              </a>
 
               {onImportToRemaster && (
                 <button
+                  type="button"
                   onClick={handleImportDirect}
                   disabled={downloading}
                   className="flex-1 sm:flex-none bg-[#2c2e38] hover:bg-[#363845] text-white border border-white/15 px-3.5 py-1.5 rounded-xl text-xs font-medium flex items-center justify-center gap-1.5 transition active:scale-95 shadow-sm"

@@ -57,6 +57,7 @@ export default function App() {
 
   // Audio files in batch
   const [files, setFiles] = useState<AudioFileItem[]>([]);
+  const [armorExternalFile, setArmorExternalFile] = useState<File | null>(null);
   const [activeFileIndex, setActiveFileIndex] = useState<number>(0);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [exportedTitleCounts, setExportedTitleCounts] = useState<Map<string, number>>(() => new Map());
@@ -272,7 +273,24 @@ export default function App() {
         const safeFileTitle = finalTitle.replace(/[\\/:*?"<>|]/g, '_').trim() || 'Beesuno_Master';
         const outputFileName = `${safeFileTitle}.${exportResult.ext}`;
 
-        const resultUrl = URL.createObjectURL(exportResult.blob);
+        let resultUrl = URL.createObjectURL(exportResult.blob);
+        try {
+          const cacheRes = await fetch(
+            `/api/audio/cache-download?filename=${encodeURIComponent(outputFileName)}&contentType=${encodeURIComponent(exportResult.blob.type || 'audio/mpeg')}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/octet-stream' },
+              body: exportResult.blob,
+            }
+          );
+          if (cacheRes.ok) {
+            const cacheData = await cacheRes.json();
+            if (cacheData?.downloadUrl) {
+              resultUrl = cacheData.downloadUrl;
+            }
+          }
+        } catch (_) {}
+
         item.resultBlob = exportResult.blob;
         item.resultUrl = resultUrl;
         item.resolvedTitle = finalTitle;
@@ -382,7 +400,10 @@ export default function App() {
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 lg:px-6 py-6">
         {activeTab === 'armor' ? (
           /* Tab 1: Suno Upload Armor */
-          <SunoUploadArmorView onNavigateTab={(tab) => setActiveTab(tab)} />
+          <SunoUploadArmorView
+            onNavigateTab={(tab) => setActiveTab(tab)}
+            externalAudioFile={armorExternalFile}
+          />
         ) : activeTab === 'cloaker' ? (
           /* Tab 2: Stealth Lyrics Cloaker / Naskah */
           <LyricsCloakerView />
@@ -393,6 +414,10 @@ export default function App() {
               handleAddFiles([file]);
               setActiveTab('remaster');
               setCurrentStep(1);
+            }}
+            onImportToArmor={(file) => {
+              setArmorExternalFile(file);
+              setActiveTab('armor');
             }}
             onNavigateTab={(tab) => {
               setActiveTab(tab);

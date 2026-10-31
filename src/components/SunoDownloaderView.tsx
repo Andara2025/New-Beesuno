@@ -26,16 +26,19 @@ interface SunoMetadata {
 
 interface SunoDownloaderViewProps {
   onImportToRemaster: (file: File) => void;
+  onImportToArmor?: (file: File) => void;
   onNavigateTab: (tab: 'cloaker' | 'armor' | 'downloader' | 'remaster') => void;
 }
 
 export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
   onImportToRemaster,
+  onImportToArmor,
 }) => {
   const [sunoUrl, setSunoUrl] = useState<string>('https://suno.com/s/thfpbMQ7o3ZldFiM');
   const [loading, setLoading] = useState<boolean>(false);
   const [downloading, setDownloading] = useState<boolean>(false);
   const [importing, setImporting] = useState<boolean>(false);
+  const [importingArmor, setImportingArmor] = useState<boolean>(false);
   const [metadata, setMetadata] = useState<SunoMetadata | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
@@ -48,6 +51,11 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
     const m = Math.floor(sec / 60);
     const s = Math.floor(sec % 60);
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const getDirectDownloadUrl = (songId: string, format: 'mp3' | 'm4a' | 'ogg', title: string, inline = false) => {
+    const cleanTitle = (title || 'Suno_Track').replace(/[\\/:*?"<>|]/g, '_');
+    return `/api/suno/download?id=${encodeURIComponent(songId)}&format=${format}${inline ? '&inline=1' : ''}&title=${encodeURIComponent(cleanTitle)}`;
   };
 
   // Auto-parse default URL on initial load
@@ -82,8 +90,8 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
       }
 
       setMetadata(data.metadata);
-      // Gunakan format=m4a&inline=1 untuk preview instan tanpa jeda transcoding
-      setAudioUrl(`/api/suno/download?id=${data.metadata.songId}&format=m4a&inline=1&title=${encodeURIComponent(data.metadata.title)}`);
+      // Gunakan format=mp3&inline=1 agar kompatibel 100% di semua browser & perangkat
+      setAudioUrl(getDirectDownloadUrl(data.metadata.songId, 'mp3', data.metadata.title, true));
     } catch (err: any) {
       setError(err.message || 'Terjadi kesalahan saat memproses tautan.');
     } finally {
@@ -91,38 +99,25 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
     }
   };
 
-  const handleDownload = async (format: 'mp3' | 'm4a' | 'ogg') => {
+  const handleDownload = async (format: 'mp3' | 'm4a' | 'ogg', e?: React.MouseEvent<HTMLAnchorElement>) => {
     if (!metadata) return;
-    setDownloading(true);
     setError(null);
-    try {
-      const url = `/api/suno/download?id=${metadata.songId}&format=${format}&title=${encodeURIComponent(metadata.title)}`;
-      const res = await fetch(url);
-      if (!res.ok) {
-        const errorText = await res.text();
-        throw new Error(errorText || `Gagal mengunduh berkas audio (${res.status})`);
-      }
-      const blob = await res.blob();
-      const blobUrl = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = blobUrl;
-      a.download = `${metadata.title}.${format}`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 30000);
-    } catch (err: any) {
-      setError(err.message || 'Gagal mengunduh audio Suno.');
-    } finally {
+    // Biarkan browser mengeksekusi native <a href="/api/suno/download?..." download> secara sinkron (aman untuk iframe & link share)
+    setDownloading(true);
+    window.setTimeout(() => {
       setDownloading(false);
+    }, 1800);
+    if (e) {
+      e.stopPropagation();
     }
   };
 
   const handleImportDirect = async () => {
     if (!metadata) return;
     setImporting(true);
+    setError(null);
     try {
-      const url = `/api/suno/download?id=${metadata.songId}&format=mp3&title=${encodeURIComponent(metadata.title)}`;
+      const url = getDirectDownloadUrl(metadata.songId, 'mp3', metadata.title);
       const res = await fetch(url);
       if (!res.ok) throw new Error('Gagal mengunduh audio untuk remaster.');
       const blob = await res.blob();
@@ -130,7 +125,26 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
       onImportToRemaster(file);
     } catch (err: any) {
       setError(err.message || 'Gagal mengirim berkas ke Studio Remaster.');
+    } finally {
       setImporting(false);
+    }
+  };
+
+  const handleImportToArmorDirect = async () => {
+    if (!metadata || !onImportToArmor) return;
+    setImportingArmor(true);
+    setError(null);
+    try {
+      const url = getDirectDownloadUrl(metadata.songId, 'mp3', metadata.title);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('Gagal mengunduh audio untuk Upload Armor.');
+      const blob = await res.blob();
+      const file = new File([blob], `${metadata.title}.mp3`, { type: 'audio/mpeg' });
+      onImportToArmor(file);
+    } catch (err: any) {
+      setError(err.message || 'Gagal mengirim berkas ke Audio Armor Studio.');
+    } finally {
+      setImportingArmor(false);
     }
   };
 
@@ -316,33 +330,54 @@ export const SunoDownloaderView: React.FC<SunoDownloaderViewProps> = ({
 
                 {/* Action Buttons */}
                 <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <button
-                    onClick={() => handleDownload('mp3')}
-                    disabled={downloading}
+                  <a
+                    href={getDirectDownloadUrl(metadata.songId, 'mp3', metadata.title)}
+                    download={`${metadata.title}.mp3`}
+                    onClick={(e) => handleDownload('mp3', e)}
                     className="bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition active:scale-95"
                   >
                     <Download className="w-3.5 h-3.5 text-zinc-300" />
-                    <span>Unduh MP3</span>
-                  </button>
+                    <span>{downloading ? 'Mengunduh...' : 'Unduh MP3'}</span>
+                  </a>
 
-                  <button
-                    onClick={() => handleDownload('ogg')}
-                    disabled={downloading}
+                  <a
+                    href={getDirectDownloadUrl(metadata.songId, 'ogg', metadata.title)}
+                    download={`${metadata.title}.ogg`}
+                    onClick={(e) => handleDownload('ogg', e)}
                     className="bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition active:scale-95"
                   >
                     <Download className="w-3.5 h-3.5 text-zinc-300" />
                     <span>Unduh OGG</span>
-                  </button>
+                  </a>
 
-                  <button
-                    onClick={() => handleDownload('m4a')}
-                    className="bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition"
+                  <a
+                    href={getDirectDownloadUrl(metadata.songId, 'm4a', metadata.title)}
+                    download={`${metadata.title}.m4a`}
+                    onClick={(e) => handleDownload('m4a', e)}
+                    className="bg-white/[0.08] hover:bg-white/[0.12] text-white border border-white/10 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition active:scale-95"
                   >
                     <FileAudio className="w-3.5 h-3.5 text-zinc-400" />
                     <span>M4A</span>
-                  </button>
+                  </a>
+
+                  {onImportToArmor && (
+                    <button
+                      type="button"
+                      onClick={handleImportToArmorDirect}
+                      disabled={importingArmor}
+                      className="bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 px-3.5 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm active:scale-95"
+                    >
+                      {importingArmor ? (
+                        <Loader2 className="w-3.5 h-3.5 animate-spin text-emerald-300" />
+                      ) : (
+                        <ArrowRight className="w-3.5 h-3.5 text-emerald-300" />
+                      )}
+                      <span>{importingArmor ? 'Mengimpor...' : 'Kirim ke Upload Armor →'}</span>
+                    </button>
+                  )}
 
                   <button
+                    type="button"
                     onClick={handleImportDirect}
                     disabled={importing}
                     className="bg-[#2c2e38] hover:bg-[#363845] text-white border border-white/15 px-4 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5 transition shadow-sm active:scale-95"

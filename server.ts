@@ -22,7 +22,7 @@ app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Headers', '*');
   res.setHeader(
     'Access-Control-Expose-Headers',
-    'Content-Disposition, Content-Length, X-Armor-Filename, X-Armor-Preset, X-Armor-Format'
+    'Content-Disposition, Content-Length, X-Armor-Filename, X-Armor-Preset, X-Armor-Format, X-Armor-Download-Id'
   );
   if (req.method === 'OPTIONS') {
     res.status(204).end();
@@ -146,7 +146,6 @@ import { spawn } from 'child_process';
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 
-// In-memory cache for audio streams (TTL 15 mins) to prevent duplicate decryption
 // In-memory cache for audio streams (TTL 15 mins) to prevent duplicate decryption/transcoding
 interface CachedAudio {
   raw: Buffer;
@@ -156,14 +155,39 @@ interface CachedAudio {
   m4a?: Buffer;
   timestamp: number;
 }
+interface CachedDownloadFile {
+  buffer: Buffer;
+  contentType: string;
+  filename: string;
+  timestamp: number;
+}
 const audioStreamCache = new Map<string, CachedAudio>();
 const metadataCache = new Map<string, any>();
+const shareTokenCache = new Map<string, string>();
+const inFlightAudioStreams = new Map<string, Promise<{ buffer: Buffer; format: 'mp3' | 'm4a' | 'wav' }>>();
+const downloadFileCache = new Map<string, CachedDownloadFile>();
+
+function cacheDownloadableAudio(buffer: Buffer, contentType: string, filename: string): string {
+  const id = crypto.randomUUID();
+  downloadFileCache.set(id, {
+    buffer,
+    contentType,
+    filename,
+    timestamp: Date.now(),
+  });
+  return id;
+}
 
 function cleanAudioCache() {
   const now = Date.now();
   for (const [key, val] of audioStreamCache.entries()) {
     if (now - val.timestamp > 15 * 60 * 1000) {
       audioStreamCache.delete(key);
+    }
+  }
+  for (const [key, val] of downloadFileCache.entries()) {
+    if (now - val.timestamp > 20 * 60 * 1000) {
+      downloadFileCache.delete(key);
     }
   }
 }
@@ -202,59 +226,131 @@ function isValidUnencryptedAudioBuffer(buf: Buffer): 'mp3' | 'm4a' | 'wav' | 'og
   return null;
 }
 
+function extractPreferredSunoUuid(text: string): string | null {
+  if (!text) return null;
+  const patterns = [
+    /\/song\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    /\/clip\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    /image_(?:large_)?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
+    /\\?"id\\?"\s*:\s*\\?"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\\?"/i,
+    UUID_RE,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) {
+      const candidate = m[1] || m[0];
+      if (candidate && candidate !== '00000000-0000-0000-0000-000000000000') {
+        return candidate;
+      }
+    }
+  }
+  return null;
+}
+
+function extractShareTokenFromUrl(text: string): string | null {
+  if (!text) return null;
+  const shParam = text.match(/[?&]sh=([a-zA-Z0-9_-]{6,32})/i);
+  if (shParam) return shParam[1];
+  const shortPath = text.match(/\/s\/([a-zA-Z0-9_-]{6,32})/i);
+  if (shortPath) return shortPath[1];
+  return null;
+}
+
 async function resolveSunoSongId(rawUrl: string): Promise<string> {
   const trimmed = rawUrl.trim();
-  // Direct UUID match in the string
-  if (UUID_RE.test(trimmed)) {
-    const m = trimmed.match(UUID_RE);
-    if (m) return m[0];
+  const initialSh = extractShareTokenFromUrl(trimmed);
+
+  // Direct UUID match in the string (e.g., https://suno.com/song/<uuid>?sh=...)
+  const directUuid = extractPreferredSunoUuid(trimmed);
+  if (directUuid) {
+    if (initialSh) shareTokenCache.set(directUuid, initialSh);
+    return directUuid;
   }
 
-  // Extract clean URL if user pasted share text + URL
-  const urlMatch = trimmed.match(/https?:\/\/[^\s"'<>]+/i);
-  const targetUrl = urlMatch ? urlMatch[0] : trimmed;
+  // Extract clean URL even if pasted without https:// or embedded inside share message text
+  let targetUrl = trimmed;
+  const fullUrlMatch = trimmed.match(/https?:\/\/[^\s"'<>]+/i);
+  const bareDomainMatch = trimmed.match(/(?:www\.|app\.)?suno\.(?:com|ai)\/[^\s"'<>]+/i);
+  const bareShortPathMatch = trimmed.match(/^\/?s\/([a-zA-Z0-9_-]{6,32})$/i);
+  const bareShortCodeMatch = trimmed.match(/^[a-zA-Z0-9_-]{8,24}$/);
 
-  // Handle /s/ shortlinks by following redirect
-  if (targetUrl.includes('suno.com/s/') || targetUrl.includes('suno.ai/s/')) {
+  if (fullUrlMatch) {
+    targetUrl = fullUrlMatch[0];
+  } else if (bareDomainMatch) {
+    targetUrl = `https://${bareDomainMatch[0]}`;
+  } else if (bareShortPathMatch) {
+    targetUrl = `https://suno.com/s/${bareShortPathMatch[1]}`;
+  } else if (bareShortCodeMatch) {
+    targetUrl = `https://suno.com/s/${bareShortCodeMatch[0]}`;
+  } else if (!/^https?:\/\//i.test(targetUrl)) {
+    targetUrl = `https://${targetUrl}`;
+  }
+
+  // Strip trailing punctuation often included when copying share messages
+  targetUrl = targetUrl.replace(/[.,;!?)+'"\]>]+$/, '');
+  const detectedSh = extractShareTokenFromUrl(targetUrl) || initialSh;
+
+  // Step 1: Handle /s/ shortlinks by following redirects hop-by-hop (up to 5 hops)
+  if (targetUrl.includes('/s/')) {
     try {
-      const res = await fetch(targetUrl, {
-        method: 'GET',
-        redirect: 'manual',
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        },
-      });
+      let currentHopUrl = targetUrl;
+      for (let hop = 0; hop < 5; hop++) {
+        const res = await fetch(currentHopUrl, {
+          method: 'GET',
+          redirect: 'manual',
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          },
+        });
 
-      const loc = res.headers.get('location');
-      if (loc) {
-        const match = loc.match(UUID_RE);
-        if (match) return match[0];
+        const loc = res.headers.get('location');
+        if (!loc) break;
+
+        const nextUrl = loc.startsWith('http') ? loc : new URL(loc, currentHopUrl).toString();
+        const hopSh = extractShareTokenFromUrl(nextUrl) || detectedSh;
+        const hopUuid = extractPreferredSunoUuid(nextUrl);
+        if (hopUuid) {
+          if (hopSh) shareTokenCache.set(hopUuid, hopSh);
+          return hopUuid;
+        }
+        currentHopUrl = nextUrl;
       }
     } catch (e) {
       console.warn('Shortlink redirect lookup warning:', e);
     }
   }
 
-  // Fallback: fetch page (following redirects) and check final URL or HTML for UUID
+  // Step 2: Fallback: fetch page (following redirects) and check final URL or HTML for song UUID
   try {
     const res = await fetch(targetUrl, {
       redirect: 'follow',
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
+    const finalSh = extractShareTokenFromUrl(res.url || '') || detectedSh;
     if (res.url) {
-      const urlUuid = res.url.match(UUID_RE);
-      if (urlUuid) return urlUuid[0];
+      const urlUuid = extractPreferredSunoUuid(res.url);
+      if (urlUuid) {
+        if (finalSh) shareTokenCache.set(urlUuid, finalSh);
+        return urlUuid;
+      }
     }
     const html = await res.text();
-    const match = html.match(UUID_RE);
-    if (match) return match[0];
+    const htmlUuid = extractPreferredSunoUuid(html);
+    if (htmlUuid) {
+      if (finalSh) shareTokenCache.set(htmlUuid, finalSh);
+      return htmlUuid;
+    }
   } catch (e) {
     console.warn('Page fetch lookup warning:', e);
   }
 
-  throw new Error('Tidak dapat menemukan ID lagu Suno dari tautan yang diberikan.');
+  throw new Error('Tidak dapat menemukan ID lagu Suno dari tautan yang diberikan. Pastikan tautan share Suno lengkap dan benar.');
 }
 
 async function fetchSunoMetadata(songId: string) {
@@ -266,6 +362,8 @@ async function fetchSunoMetadata(songId: string) {
   let model = 'v6';
   let audioUrl = '';
   let videoUrl = '';
+  const mediaUrls: string[] = [];
+  const shToken = shareTokenCache.get(songId) || '';
 
   const isUsableMediaUrl = (u: unknown): u is string =>
     typeof u === 'string' &&
@@ -285,18 +383,27 @@ async function fetchSunoMetadata(songId: string) {
         headers: {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Accept: 'application/json',
+          Origin: 'https://suno.com',
+          Referer: `https://suno.com/song/${songId}${shToken ? `?sh=${shToken}` : ''}`,
         },
       });
 
       if (res.ok) {
         const data = await res.json();
-        if (data && data.title) {
-          title = data.title;
+        if (data && (data.title || data.id)) {
+          title = data.title || title;
           artist = data.display_name || data.handle || artist;
           imageUrl = data.image_large_url || data.image_url || imageUrl;
           model = data.major_model_version || model;
           if (isUsableMediaUrl(data.audio_url)) audioUrl = data.audio_url;
           if (isUsableMediaUrl(data.video_url)) videoUrl = data.video_url;
+          if (Array.isArray(data.media_urls)) {
+            for (const item of data.media_urls) {
+              if (item && isUsableMediaUrl(item.url) && !mediaUrls.includes(item.url)) {
+                mediaUrls.push(item.url);
+              }
+            }
+          }
           if (data.metadata) {
             prompt = data.metadata.prompt || '';
             if (data.metadata.duration && typeof data.metadata.duration === 'number') {
@@ -317,7 +424,8 @@ async function fetchSunoMetadata(songId: string) {
             model,
             audioUrl,
             videoUrl,
-            shortlink: `https://suno.com/song/${songId}`,
+            mediaUrls,
+            shortlink: `https://suno.com/song/${songId}${shToken ? `?sh=${shToken}` : ''}`,
           };
           metadataCache.set(songId, meta);
           return meta;
@@ -328,12 +436,14 @@ async function fetchSunoMetadata(songId: string) {
     }
   }
 
-  // Fallback: Scrape Suno web page
+  // Fallback: Scrape Suno web page (including ?sh= share token for unlisted/link-only songs)
   try {
-    const pageUrl = `https://suno.com/song/${songId}`;
+    const pageUrl = `https://suno.com/song/${songId}${shToken ? `?sh=${shToken}` : ''}`;
     const res = await fetch(pageUrl, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       },
     });
     const html = await res.text();
@@ -369,6 +479,17 @@ async function fetchSunoMetadata(songId: string) {
       prompt = promptMatch[1].replace(/\\n/g, '\n').replace(/\\"/g, '"');
     }
 
+    // CloudFront media_urls in HTML flight data
+    const cfMatch = html.match(/https:\/\/[a-z0-9]+\.cloudfront\.net\/[^\s"\\<>]+\.m4a/gi);
+    if (cfMatch) {
+      for (const u of cfMatch) {
+        const cleanU = u.replace(/\\u0026/g, '&');
+        if (isUsableMediaUrl(cleanU) && !mediaUrls.includes(cleanU)) {
+          mediaUrls.push(cleanU);
+        }
+      }
+    }
+
     // Audio/Video URLs in HTML flight data
     const audioUrlMatch = html.match(/\\?"audio_url\\?":\s*\\?"([^"\\]+)\\?"/i) || html.match(/"audio_url":"([^"]+)"/i);
     if (audioUrlMatch) {
@@ -394,7 +515,8 @@ async function fetchSunoMetadata(songId: string) {
     model,
     audioUrl,
     videoUrl,
-    shortlink: `https://suno.com/song/${songId}`,
+    mediaUrls,
+    shortlink: `https://suno.com/song/${songId}${shToken ? `?sh=${shToken}` : ''}`,
   };
   metadataCache.set(songId, resultMeta);
   return resultMeta;
@@ -402,6 +524,8 @@ async function fetchSunoMetadata(songId: string) {
 
 // Decryptor for DRM-encrypted clips (Mango license protocol + CloudFront AES-128-CTR stream)
 async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
+  const shToken = shareTokenCache.get(songId) || '';
+  const refererUrl = `https://suno.com/song/${songId}${shToken ? `?sh=${shToken}` : ''}`;
   const rightsEndpoints = [
     'https://studio-api.prod.suno.com/api/mango/rights',
     'https://studio-api-prod.suno.com/api/mango/rights',
@@ -418,8 +542,9 @@ async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
           'Content-Type': 'application/json',
           Accept: 'application/json',
           Origin: 'https://suno.com',
-          Referer: `https://suno.com/song/${songId}`,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+          Referer: refererUrl,
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         },
         body: JSON.stringify({
           content_params: { content_id: songId, content_type: 'clip' },
@@ -476,20 +601,49 @@ async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
   );
   const contentIv = new Uint8Array(contentIvRaw);
 
-  // Fetch encrypted m4a stream from CloudFront
-  const audioUrl = `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.m4a`;
-  const audioRes = await fetch(audioUrl, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      Referer: 'https://suno.com/',
-    },
-  });
-
-  if (!audioRes.ok) {
-    throw new Error(`Gagal mengunduh audio terenkripsi CloudFront (HTTP ${audioRes.status})`);
+  // Ensure metadata is available so we have any custom CloudFront media_urls
+  let meta = metadataCache.get(songId);
+  if (!meta) {
+    try {
+      meta = await fetchSunoMetadata(songId);
+    } catch (_) {}
   }
 
-  const encArrayBuf = await audioRes.arrayBuffer();
+  const streamUrls: string[] = [];
+  if (meta?.mediaUrls && Array.isArray(meta.mediaUrls)) {
+    for (const u of meta.mediaUrls) {
+      if (typeof u === 'string' && u.startsWith('http') && !streamUrls.includes(u)) {
+        streamUrls.push(u);
+      }
+    }
+  }
+  const defaultCfUrl = `https://d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.m4a`;
+  if (!streamUrls.includes(defaultCfUrl)) {
+    streamUrls.push(defaultCfUrl);
+  }
+
+  let encArrayBuf: ArrayBuffer | null = null;
+  let lastStreamStatus = 0;
+
+  for (const audioUrl of streamUrls) {
+    try {
+      const audioRes = await fetch(audioUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          Referer: 'https://suno.com/',
+        },
+      });
+      lastStreamStatus = audioRes.status;
+      if (audioRes.ok) {
+        encArrayBuf = await audioRes.arrayBuffer();
+        break;
+      }
+    } catch (_) {}
+  }
+
+  if (!encArrayBuf) {
+    throw new Error(`Gagal mengunduh audio terenkripsi CloudFront (HTTP ${lastStreamStatus})`);
+  }
 
   // Decrypt AES-128-CTR stream
   const contentKey = await crypto.subtle.importKey('raw', contentKeyRaw, { name: 'AES-CTR' }, false, ['decrypt']);
@@ -506,7 +660,7 @@ async function decryptSunoAudioStream(songId: string): Promise<Buffer> {
   return Buffer.from(decryptedBuf);
 }
 
-// Multi-Source Audio Downloader: Prioritizes DRM Mango Decryption & verified unencrypted CDN streams
+// Multi-Source Audio Downloader with In-Flight Promise Deduplication
 async function fetchSunoAudioStream(songId: string): Promise<{ buffer: Buffer; format: 'mp3' | 'm4a' | 'wav' }> {
   // 1. Check in-memory cache (verify cached buffer is genuine unencrypted audio)
   const cached = audioStreamCache.get(songId);
@@ -514,70 +668,92 @@ async function fetchSunoAudioStream(songId: string): Promise<{ buffer: Buffer; f
     return { buffer: cached.raw, format: cached.rawFormat };
   }
 
-  // 2. Try Mango DRM Decryption first (Standard for Suno v4/v5/v6 tracks; returns genuine 'ftypisom' M4A AAC)
-  try {
-    const decryptedM4a = await decryptSunoAudioStream(songId);
-    if (decryptedM4a && isValidUnencryptedAudioBuffer(decryptedM4a)) {
-      audioStreamCache.set(songId, {
-        raw: decryptedM4a,
-        rawFormat: 'm4a',
-        m4a: decryptedM4a,
-        timestamp: Date.now(),
-      });
-      return { buffer: decryptedM4a, format: 'm4a' };
-    }
-  } catch (err: any) {
-    console.warn(`Mango DRM decryption notice for ${songId}:`, err?.message);
+  // 2. Deduplicate concurrent requests for the same songId
+  const existingInFlight = inFlightAudioStreams.get(songId);
+  if (existingInFlight) {
+    return existingInFlight;
   }
 
-  // 3. Fallback: Try direct public CDN endpoints (for older v3/v3.5 tracks) with strict magic-byte verification
-  // NEVER include d2lwuy8qc234o3.cloudfront.net/1/clip/${songId}.m4a here because that stream is AES-CTR encrypted!
-  const meta = metadataCache.get(songId);
-  const candidates: string[] = [];
-  if (meta?.audioUrl && !meta.audioUrl.includes('forbidden')) {
-    candidates.push(meta.audioUrl);
-  }
-  candidates.push(
-    `https://cdn1.suno.ai/${songId}.mp3`,
-    `https://cdn2.suno.ai/${songId}.mp3`,
-    `https://audiocdn.suno.ai/${songId}.mp3`,
-    `https://cdn.suno.ai/${songId}.mp3`
-  );
-  if (meta?.videoUrl && !meta.videoUrl.includes('forbidden')) {
-    candidates.push(meta.videoUrl);
-  }
-
-  for (const url of candidates) {
+  const streamPromise = (async (): Promise<{ buffer: Buffer; format: 'mp3' | 'm4a' | 'wav' }> => {
+    // Try Mango DRM Decryption first (Standard for Suno v4/v5/v6 tracks)
     try {
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-          Referer: 'https://suno.com/',
-          Accept: '*/*',
-        },
-      });
-
-      if (res.ok) {
-        const ab = await res.arrayBuffer();
-        const buf = Buffer.from(ab);
-        const detectedFormat = isValidUnencryptedAudioBuffer(buf);
-        if (detectedFormat) {
-          const format: 'mp3' | 'm4a' | 'wav' = detectedFormat === 'm4a' ? 'm4a' : detectedFormat === 'wav' ? 'wav' : 'mp3';
-          audioStreamCache.set(songId, {
-            raw: buf,
-            rawFormat: format,
-            ...(format === 'mp3' ? { mp3: buf } : format === 'm4a' ? { m4a: buf } : {}),
-            timestamp: Date.now(),
-          });
-          return { buffer: buf, format };
-        }
+      const decryptedM4a = await decryptSunoAudioStream(songId);
+      if (decryptedM4a && isValidUnencryptedAudioBuffer(decryptedM4a)) {
+        audioStreamCache.set(songId, {
+          raw: decryptedM4a,
+          rawFormat: 'm4a',
+          timestamp: Date.now(),
+        });
+        return { buffer: decryptedM4a, format: 'm4a' };
       }
-    } catch {
-      // Continue to next candidate
+    } catch (err: any) {
+      console.warn(`Mango DRM decryption notice for ${songId}:`, err?.message);
     }
-  }
 
-  throw new Error(`Tidak dapat mengunduh berkas audio dari CDN Suno untuk ID "${songId}". Pastikan lagu ini publik atau coba tautan lagu Suno lainnya.`);
+    // Fallback: Try direct public CDN endpoints (for older v3/v3.5 tracks) with strict magic-byte verification
+    let meta = metadataCache.get(songId);
+    if (!meta) {
+      try {
+        meta = await fetchSunoMetadata(songId);
+      } catch (_) {}
+    }
+    const candidates: string[] = [];
+    if (meta?.audioUrl && !meta.audioUrl.includes('forbidden')) {
+      candidates.push(meta.audioUrl);
+    }
+    candidates.push(
+      `https://cdn1.suno.ai/${songId}.mp3`,
+      `https://cdn2.suno.ai/${songId}.mp3`,
+      `https://audiocdn.suno.ai/${songId}.mp3`,
+      `https://cdn.suno.ai/${songId}.mp3`
+    );
+    if (meta?.videoUrl && !meta.videoUrl.includes('forbidden')) {
+      candidates.push(meta.videoUrl);
+    }
+
+    for (const url of candidates) {
+      try {
+        const res = await fetch(url, {
+          headers: {
+            'User-Agent':
+              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            Referer: 'https://suno.com/',
+            Accept: '*/*',
+          },
+        });
+
+        if (res.ok) {
+          const ab = await res.arrayBuffer();
+          const buf = Buffer.from(ab);
+          const detectedFormat = isValidUnencryptedAudioBuffer(buf);
+          if (detectedFormat) {
+            const format: 'mp3' | 'm4a' | 'wav' =
+              detectedFormat === 'm4a' ? 'm4a' : detectedFormat === 'wav' ? 'wav' : 'mp3';
+            audioStreamCache.set(songId, {
+              raw: buf,
+              rawFormat: format,
+              ...(format === 'mp3' ? { mp3: buf } : {}),
+              timestamp: Date.now(),
+            });
+            return { buffer: buf, format };
+          }
+        }
+      } catch {
+        // Continue to next candidate
+      }
+    }
+
+    throw new Error(
+      `Tidak dapat mengunduh berkas audio dari CDN Suno untuk ID "${songId}". Pastikan lagu ini publik atau memiliki tautan share yang aktif.`
+    );
+  })();
+
+  inFlightAudioStreams.set(songId, streamPromise);
+  try {
+    return await streamPromise;
+  } finally {
+    inFlightAudioStreams.delete(songId);
+  }
 }
 
 // Universal Audio Transcoder with EPIPE safety
@@ -1545,6 +1721,7 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
 
     const safeAsciiFilename = (result.filename || 'Armor_Audio.mp3').replace(/[^a-zA-Z0-9_\-\.]/g, '_');
     const encodedFilename = encodeURIComponent(result.filename || safeAsciiFilename);
+    const downloadId = cacheDownloadableAudio(result.buffer, result.mimeType, safeAsciiFilename);
 
     res.setHeader('Content-Type', result.mimeType);
     res.setHeader('Content-Length', result.buffer.length);
@@ -1555,6 +1732,7 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
     res.setHeader('X-Armor-Filename', safeAsciiFilename);
     res.setHeader('X-Armor-Preset', preset);
     res.setHeader('X-Armor-Format', format);
+    res.setHeader('X-Armor-Download-Id', downloadId);
     res.send(result.buffer);
   } catch (error: any) {
     console.error('Armor Processor Error:', error);
@@ -1564,6 +1742,50 @@ const handleArmorProcess = async (req: express.Request, res: express.Response) =
 
 app.post('/api/armor/process', express.raw({ type: () => true, limit: '200mb' }), handleArmorProcess);
 app.post('/api/armor/process-cosu', express.raw({ type: () => true, limit: '200mb' }), handleArmorProcess);
+
+// Cache any client-rendered audio buffer on the server so it can be downloaded via a native HTTP GET attachment link (bypassing iframe blob: restrictions)
+app.post('/api/audio/cache-download', express.raw({ type: () => true, limit: '200mb' }), async (req, res) => {
+  try {
+    const audioBuffer = await getRequestAudioBuffer(req);
+    if (!audioBuffer || audioBuffer.length === 0) {
+      res.status(400).json({ error: 'Buffer audio kosong.' });
+      return;
+    }
+    const rawFilename = (req.query.filename as string) || 'Beesuno_Audio.mp3';
+    const safeFilename = rawFilename.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+    const contentType = (req.query.contentType as string) || 'audio/mpeg';
+    const downloadId = cacheDownloadableAudio(audioBuffer, contentType, safeFilename);
+    res.json({
+      success: true,
+      downloadId,
+      downloadUrl: `/api/audio/download/${downloadId}?filename=${encodeURIComponent(safeFilename)}`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Gagal menyimpan cache unduhan.' });
+  }
+});
+
+// Direct HTTP GET attachment download endpoint (works reliably in Share Link iframes, Safari, and mobile WebViews)
+app.get('/api/audio/download/:id', (req, res) => {
+  const id = req.params.id;
+  const cached = downloadFileCache.get(id);
+  if (!cached) {
+    res.status(404).send('Berkas unduhan sudah kedaluwarsa atau tidak ditemukan. Silakan proses ulang.');
+    return;
+  }
+  const rawName = (req.query.filename as string) || cached.filename || 'Beesuno_Audio.mp3';
+  const safeFilename = rawName.replace(/[^a-zA-Z0-9_\-\.]/g, '_');
+  const encodedFilename = encodeURIComponent(rawName);
+
+  res.setHeader('Content-Type', cached.contentType || 'application/octet-stream');
+  res.setHeader('Content-Length', cached.buffer.length);
+  res.setHeader(
+    'Content-Disposition',
+    `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`
+  );
+  res.setHeader('Cache-Control', 'no-cache');
+  res.send(cached.buffer);
+});
 
 // Fast Preview Endpoint (15s 256kbps MP3 via CoSuProcessor.renderPreviewFilter)
 const handleArmorPreview = async (req: express.Request, res: express.Response) => {
@@ -1666,7 +1888,7 @@ app.get('/api/suno/download', async (req, res) => {
     const format = ((req.query.format as string) || 'mp3').toLowerCase() as 'mp3' | 'm4a' | 'ogg';
     const isInline = req.query.inline === '1' || req.query.inline === 'true';
     const rawTitle = (req.query.title as string) || 'Suno_Track';
-    const cleanTitle = rawTitle.replace(/[^a-zA-Z0-9_\-]/g, '_');
+    const cleanTitle = rawTitle.replace(/[^a-zA-Z0-9_\-]/g, '_') || 'Suno_Track';
 
     if (!songId || !UUID_RE.test(songId)) {
       res.status(400).send('ID lagu Suno tidak valid.');
@@ -1691,16 +1913,13 @@ app.get('/api/suno/download', async (req, res) => {
     } else if (format === 'm4a') {
       contentType = 'audio/mp4';
       fileExt = 'm4a';
-      if (audioInfo.format === 'm4a') {
-        outputBuffer = audioInfo.buffer;
+      const cached = audioStreamCache.get(songId);
+      if (cached?.m4a) {
+        outputBuffer = cached.m4a;
       } else {
-        const cached = audioStreamCache.get(songId);
-        if (cached?.m4a) {
-          outputBuffer = cached.m4a;
-        } else {
-          outputBuffer = await transcodeAudio(audioInfo.buffer, 'm4a');
-          if (cached) cached.m4a = outputBuffer;
-        }
+        // Always transcode to genuine AAC M4A because raw CloudFront stream is m4a-opus
+        outputBuffer = await transcodeAudio(audioInfo.buffer, 'm4a');
+        if (cached) cached.m4a = outputBuffer;
       }
     } else {
       // mp3
@@ -1721,12 +1940,13 @@ app.get('/api/suno/download', async (req, res) => {
 
     const totalLength = outputBuffer.length;
     const range = req.headers.range;
+    const encodedFilename = encodeURIComponent(`${cleanTitle}.${fileExt}`);
 
     res.setHeader('Content-Type', contentType);
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader(
       'Content-Disposition',
-      `${isInline ? 'inline' : 'attachment'}; filename="${cleanTitle}.${fileExt}"`
+      `${isInline ? 'inline' : 'attachment'}; filename="${cleanTitle}.${fileExt}"; filename*=UTF-8''${encodedFilename}`
     );
 
     if (range) {
